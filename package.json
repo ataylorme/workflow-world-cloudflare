@@ -1,0 +1,64 @@
+{
+	"name": "@ataylorme/workflow-world-cloudflare",
+	"version": "1.0.0-beta1",
+	"description": "Cloudflare Workers world implementation for Workflow DevKit using Durable Objects, D1, and Cloudflare Queues",
+	"type": "module",
+	"main": "dist/index.js",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"default": "./dist/index.js"
+		},
+		"./durable-object": {
+			"types": "./dist/durable-object.d.ts",
+			"default": "./dist/durable-object.js"
+		},
+		"./d1": {
+			"types": "./dist/d1.d.ts",
+			"default": "./dist/d1.js"
+		}
+	},
+	"files": [
+		"dist"
+	],
+	"publishConfig": {
+		"access": "public"
+	},
+	"license": "Apache-2.0",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/ataylorme/workflow-world-cloudflare.git"
+	},
+	"engines": {
+		"node": ">=24"
+	},
+	"scripts": {
+		"build": "bash scripts/build.sh",
+		"dev": "tsc --watch",
+		"check": "biome check .",
+		"check:fix": "biome check --write .",
+		"test": "vitest run",
+		"typecheck": "tsc --noEmit",
+		"prepublishOnly": "npm run check && npm run test && npm run build"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "^2.4.8",
+		"@cloudflare/workers-types": "^4.20260317.1",
+		"@types/node": "^24.0.0",
+		"@vercel/ncc": "^0.38.4",
+		"@workflow/errors": "^4.1.0-beta.18",
+		"@workflow/world": "^4.1.0-beta.13",
+		"@workflow/world-local": "^4.1.0-beta.44",
+		"typescript": "^5.9.3",
+		"ulid": "^2.4.0",
+		"vitest": "^4.1.0",
+		"zod": "^4.3.6"
+	},
+	"keywords": [
+		"cloudflare",
+		"workers",
+		"durable-objects",
+		"workflow",
+		"vercel-workflow"
+	]
+}
