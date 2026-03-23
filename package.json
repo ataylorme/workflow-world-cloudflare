@@ -18,6 +18,9 @@
 			"default": "./dist/d1.js"
 		}
 	},
+	"bin": {
+		"workflow-world-cloudflare": "dist/setup.js"
+	},
 	"files": [
 		"dist"
 	],
