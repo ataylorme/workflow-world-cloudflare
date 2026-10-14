@@ -92,39 +92,61 @@ export async function upsertRunIndex(
 		.run();
 }
 
-/** Insert a hook into the D1 index */
-export async function insertHookIndex(
+export interface HookTokenClaim {
+	hookId: string;
+	runId: string;
+}
+
+/**
+ * Claim a hook token for `(runId, hookId)`, or report who already holds it.
+ *
+ * Tokens are unique across runs, and each run lives in its own Durable
+ * Object, so no single run's storage can arbitrate a token. The `UNIQUE`
+ * constraint on `workflow_hooks_index.token` does: the insert is a no-op when
+ * any row holds the token, and the read-back returns the holder. A retry of
+ * the same creation reads back its own claim.
+ */
+export async function claimHookToken(
 	db: D1Database,
 	hook: {
 		hookId: string;
 		runId: string;
 		token: string;
-		ownerId: string;
-		projectId: string;
-		environment: string;
 		createdAt: string;
 		isWebhook?: boolean;
 		specVersion?: number;
 	},
-): Promise<void> {
-	await db
-		.prepare(
-			`INSERT OR IGNORE INTO workflow_hooks_index
+): Promise<HookTokenClaim> {
+	const [, owner] = await db.batch<{ hook_id: string; run_id: string }>([
+		db
+			.prepare(
+				`INSERT OR IGNORE INTO workflow_hooks_index
         (hook_id, run_id, token, owner_id, project_id, environment, created_at, is_webhook, spec_version)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		)
-		.bind(
-			hook.hookId,
-			hook.runId,
-			hook.token,
-			hook.ownerId,
-			hook.projectId,
-			hook.environment,
-			hook.createdAt,
-			hook.isWebhook !== false ? 1 : 0,
-			hook.specVersion ?? null,
-		)
-		.run();
+       VALUES (?, ?, ?, '', '', '', ?, ?, ?)`,
+			)
+			.bind(
+				hook.hookId,
+				hook.runId,
+				hook.token,
+				hook.createdAt,
+				hook.isWebhook ? 1 : 0,
+				hook.specVersion ?? null,
+			),
+		db
+			.prepare(
+				"SELECT hook_id, run_id FROM workflow_hooks_index WHERE token = ?",
+			)
+			.bind(hook.token),
+	]);
+	const row = owner.results[0];
+	if (!row) {
+		// The insert was ignored because `hook_id` (not the token) collided:
+		// the same hook id already holds a different token.
+		throw new Error(
+			`Hook "${hook.hookId}" already holds a different token in the index`,
+		);
+	}
+	return { hookId: row.hook_id, runId: row.run_id };
 }
 
 /** Delete a hook from the D1 index */

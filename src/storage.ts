@@ -1,8 +1,10 @@
-import { HookNotFoundError, WorkflowAPIError } from "@workflow/errors";
+import { HookNotFoundError, WorkflowWorldError } from "@workflow/errors";
+import { globalSingleton } from "@workflow/utils";
 import type {
 	CreateEventParams,
 	CreateEventRequest,
 	Event,
+	EventListResponse,
 	EventResult,
 	GetEventParams,
 	GetHookParams,
@@ -26,7 +28,11 @@ import { monotonicFactory } from "ulid";
 import type { CloudflareWorldConfig } from "./config.js";
 import { doFetch, getRunStub } from "./util.js";
 
-const ulid = monotonicFactory();
+const ids = globalSingleton(
+	"@ataylorme/workflow-world-cloudflare//storage-ids",
+	1,
+	() => ({ ulid: monotonicFactory() }),
+);
 
 /**
  * Creates the Storage implementation that routes requests to Durable Objects
@@ -41,15 +47,36 @@ export function createStorage(config: CloudflareWorldConfig): Storage {
 	};
 }
 
+function indexRowToRun(row: Record<string, unknown>): WorkflowRunWithoutData {
+	return {
+		runId: row.run_id as string,
+		workflowName: row.workflow_name as string,
+		status: row.status as WorkflowRun["status"],
+		deploymentId: row.deployment_id as string,
+		specVersion: (row.spec_version as number | null) ?? undefined,
+		attributes: {},
+		input: undefined,
+		output: undefined,
+		error: undefined,
+		createdAt: new Date(row.created_at as string),
+		updatedAt: new Date(row.updated_at as string),
+		startedAt: row.started_at ? new Date(row.started_at as string) : undefined,
+		completedAt: row.completed_at
+			? new Date(row.completed_at as string)
+			: undefined,
+		expiredAt: row.expired_at ? new Date(row.expired_at as string) : undefined,
+	} as WorkflowRunWithoutData;
+}
+
 function createRunsStorage(config: CloudflareWorldConfig): Storage["runs"] {
 	return {
 		get: (async (id: string, params?: GetWorkflowRunParams) => {
 			const stub = getRunStub(config.runs, id);
-			const resolveData = params?.resolveData ?? "all";
-			return doFetch<WorkflowRun | WorkflowRunWithoutData>(
-				stub,
-				`/run?resolveData=${resolveData}`,
-			);
+			const qs = new URLSearchParams({
+				runId: id,
+				resolveData: params?.resolveData ?? "all",
+			});
+			return doFetch<WorkflowRun | WorkflowRunWithoutData>(stub, `/run?${qs}`);
 		}) as Storage["runs"]["get"],
 
 		list: (async (params?: ListWorkflowRunsParams) => {
@@ -57,7 +84,6 @@ function createRunsStorage(config: CloudflareWorldConfig): Storage["runs"] {
 			const cursor = params?.pagination?.cursor;
 			const resolveData = params?.resolveData ?? "all";
 
-			// Query D1 index for the list
 			let sql = "SELECT * FROM workflow_runs_index WHERE 1=1";
 			const bindings: unknown[] = [];
 
@@ -65,9 +91,16 @@ function createRunsStorage(config: CloudflareWorldConfig): Storage["runs"] {
 				sql += " AND workflow_name = ?";
 				bindings.push(params.workflowName);
 			}
-			if (params?.status) {
-				sql += " AND status = ?";
-				bindings.push(params.status);
+			if (params?.status !== undefined) {
+				const statuses = Array.isArray(params.status)
+					? params.status
+					: [params.status];
+				if (statuses.length === 0) {
+					// `status: []` matches nothing, like SQL `IN ()`.
+					return { data: [], cursor: null, hasMore: false };
+				}
+				sql += ` AND status IN (${statuses.map(() => "?").join(", ")})`;
+				bindings.push(...statuses);
 			}
 			if (cursor) {
 				sql += " AND run_id < ?";
@@ -83,76 +116,29 @@ function createRunsStorage(config: CloudflareWorldConfig): Storage["runs"] {
 
 			const rows = result.results.slice(0, limit) as Record<string, unknown>[];
 			const hasMore = result.results.length > limit;
+			const nextCursor = (rows.at(-1)?.run_id as string) ?? null;
 
 			if (resolveData === "none") {
-				const data = rows.map((row) => ({
-					runId: row.run_id as string,
-					workflowName: row.workflow_name as string,
-					status: row.status as WorkflowRun["status"],
-					deploymentId: row.deployment_id as string,
-					specVersion: row.spec_version as number,
-					input: undefined,
-					output: undefined,
-					error: undefined,
-					createdAt: new Date(row.created_at as string),
-					updatedAt: new Date(row.updated_at as string),
-					startedAt: row.started_at
-						? new Date(row.started_at as string)
-						: undefined,
-					completedAt: row.completed_at
-						? new Date(row.completed_at as string)
-						: undefined,
-					expiredAt: row.expired_at
-						? new Date(row.expired_at as string)
-						: undefined,
-				}));
-				return {
-					data,
-					cursor: (rows.at(-1)?.run_id as string) ?? null,
-					hasMore,
-				};
+				return { data: rows.map(indexRowToRun), cursor: nextCursor, hasMore };
 			}
 
 			// For resolveData='all', fan out to DOs for full data
 			const data = await Promise.all(
 				rows.map(async (row) => {
-					const stub = getRunStub(config.runs, row.run_id as string);
+					const runId = row.run_id as string;
 					try {
 						return await doFetch<WorkflowRun>(
-							stub,
-							`/run?resolveData=${resolveData}`,
+							getRunStub(config.runs, runId),
+							`/run?${new URLSearchParams({ runId, resolveData })}`,
 						);
 					} catch {
 						// If DO is unavailable, fall back to index data
-						return {
-							runId: row.run_id as string,
-							workflowName: row.workflow_name as string,
-							status: row.status as string,
-							deploymentId: row.deployment_id as string,
-							specVersion: row.spec_version as number,
-							input: undefined,
-							output: undefined,
-							createdAt: new Date(row.created_at as string),
-							updatedAt: new Date(row.updated_at as string),
-							startedAt: row.started_at
-								? new Date(row.started_at as string)
-								: undefined,
-							completedAt: row.completed_at
-								? new Date(row.completed_at as string)
-								: undefined,
-							expiredAt: row.expired_at
-								? new Date(row.expired_at as string)
-								: undefined,
-						} as WorkflowRun;
+						return indexRowToRun(row) as WorkflowRun;
 					}
 				}),
 			);
 
-			return {
-				data,
-				cursor: (rows.at(-1)?.run_id as string) ?? null,
-				hasMore,
-			};
+			return { data, cursor: nextCursor, hasMore };
 		}) as Storage["runs"]["list"],
 	};
 }
@@ -166,21 +152,24 @@ function createEventsStorage(config: CloudflareWorldConfig): Storage["events"] {
 		): Promise<EventResult> {
 			// For run_created with null runId, generate the runId client-side so
 			// the routing key and the stored runId map to the same DO instance.
-			let effectiveRunId = runId;
-			if (data.eventType === "run_created" && !runId) {
-				effectiveRunId = `wrun_${ulid()}`;
+			const effectiveRunId =
+				data.eventType === "run_created" && !runId
+					? `wrun_${ids.ulid()}`
+					: runId;
+			if (!effectiveRunId) {
+				throw new WorkflowWorldError(
+					"runId is required for non-run_created events",
+					{ status: 400 },
+				);
 			}
-
-			const stub = getRunStub(config.runs, effectiveRunId as string);
-			return doFetch<EventResult>(stub, "/events", {
-				method: "POST",
-				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({
-					runId: effectiveRunId,
-					data,
-					params,
-				}),
-			});
+			// The observer is an in-process callback and cannot cross into the
+			// Durable Object. It is optional for a World to call it.
+			const { replayEventObserver: _observer, ...wireParams } = params ?? {};
+			return doFetch<EventResult>(
+				getRunStub(config.runs, effectiveRunId),
+				"/events",
+				{ body: { runId: effectiveRunId, data, params: wireParams } },
+			);
 		},
 
 		async get(
@@ -188,17 +177,35 @@ function createEventsStorage(config: CloudflareWorldConfig): Storage["events"] {
 			eventId: string,
 			params?: GetEventParams,
 		): Promise<Event> {
-			const stub = getRunStub(config.runs, runId);
 			const resolveData = params?.resolveData ?? "all";
 			return doFetch<Event>(
-				stub,
+				getRunStub(config.runs, runId),
 				`/events/${encodeURIComponent(eventId)}?resolveData=${resolveData}`,
 			);
 		},
 
-		async list(params: ListEventsParams): Promise<PaginatedResponse<Event>> {
-			const stub = getRunStub(config.runs, params.runId);
+		async list(params: ListEventsParams): Promise<EventListResponse> {
 			const qs = new URLSearchParams({
+				sortOrder: params.pagination?.sortOrder ?? "asc",
+				resolveData: params.resolveData ?? "all",
+			});
+			if (params.pagination?.limit) {
+				qs.set("limit", String(params.pagination.limit));
+			}
+			if (params.pagination?.cursor) {
+				qs.set("cursor", params.pagination.cursor);
+			}
+			return doFetch<EventListResponse>(
+				getRunStub(config.runs, params.runId),
+				`/events?${qs}`,
+			);
+		},
+
+		async listByCorrelationId(
+			params: ListEventsByCorrelationIdParams,
+		): Promise<PaginatedResponse<Event>> {
+			const qs = new URLSearchParams({
+				correlationId: params.correlationId,
 				limit: String(params.pagination?.limit ?? 100),
 				sortOrder: params.pagination?.sortOrder ?? "asc",
 				resolveData: params.resolveData ?? "all",
@@ -206,38 +213,31 @@ function createEventsStorage(config: CloudflareWorldConfig): Storage["events"] {
 			if (params.pagination?.cursor) {
 				qs.set("cursor", params.pagination.cursor);
 			}
-			return doFetch<PaginatedResponse<Event>>(stub, `/events?${qs}`);
-		},
-
-		async listByCorrelationId(
-			_params: ListEventsByCorrelationIdParams,
-		): Promise<PaginatedResponse<Event>> {
-			throw new WorkflowAPIError(
-				"listByCorrelationId requires routing context. Use events.list with runId instead.",
-				{ status: 501 },
+			return doFetch<PaginatedResponse<Event>>(
+				getRunStub(config.runs, params.runId),
+				`/events?${qs}`,
 			);
 		},
 	};
 }
 
 function createHooksStorage(config: CloudflareWorldConfig): Storage["hooks"] {
+	const fetchHook = (runId: string, hookId: string, params?: GetHookParams) =>
+		doFetch<Hook>(
+			getRunStub(config.runs, runId),
+			`/hooks/${encodeURIComponent(hookId)}?resolveData=${params?.resolveData ?? "all"}`,
+		);
+
 	return {
 		async get(hookId: string, params?: GetHookParams): Promise<Hook> {
 			const result = await config.db
 				.prepare("SELECT run_id FROM workflow_hooks_index WHERE hook_id = ?")
 				.bind(hookId)
 				.first<{ run_id: string }>();
-
 			if (!result) {
 				throw new HookNotFoundError(hookId);
 			}
-
-			const stub = getRunStub(config.runs, result.run_id);
-			const resolveData = params?.resolveData ?? "all";
-			return doFetch<Hook>(
-				stub,
-				`/hooks/${encodeURIComponent(hookId)}?resolveData=${resolveData}`,
-			);
+			return fetchHook(result.run_id, hookId, params);
 		},
 
 		async getByToken(token: string, params?: GetHookParams): Promise<Hook> {
@@ -247,22 +247,14 @@ function createHooksStorage(config: CloudflareWorldConfig): Storage["hooks"] {
 				)
 				.bind(token)
 				.first<{ hook_id: string; run_id: string }>();
-
 			if (!result) {
 				throw new HookNotFoundError(token);
 			}
-
-			const stub = getRunStub(config.runs, result.run_id);
-			const resolveData = params?.resolveData ?? "all";
-			return doFetch<Hook>(
-				stub,
-				`/hooks/${encodeURIComponent(result.hook_id)}?resolveData=${resolveData}`,
-			);
+			return fetchHook(result.run_id, result.hook_id, params);
 		},
 
 		async list(params: ListHooksParams): Promise<PaginatedResponse<Hook>> {
 			if (params.runId) {
-				const stub = getRunStub(config.runs, params.runId);
 				const qs = new URLSearchParams({
 					limit: String(params.pagination?.limit ?? 100),
 					sortOrder: params.pagination?.sortOrder ?? "asc",
@@ -271,7 +263,10 @@ function createHooksStorage(config: CloudflareWorldConfig): Storage["hooks"] {
 				if (params.pagination?.cursor) {
 					qs.set("cursor", params.pagination.cursor);
 				}
-				return doFetch<PaginatedResponse<Hook>>(stub, `/hooks?${qs}`);
+				return doFetch<PaginatedResponse<Hook>>(
+					getRunStub(config.runs, params.runId),
+					`/hooks?${qs}`,
+				);
 			}
 
 			// Without runId, query D1 index then fan out to DOs
@@ -296,14 +291,13 @@ function createHooksStorage(config: CloudflareWorldConfig): Storage["hooks"] {
 			const rows = result.results.slice(0, limit) as Record<string, unknown>[];
 			const hasMore = result.results.length > limit;
 
-			const resolveData = params.resolveData ?? "all";
 			const data = await Promise.all(
 				rows.map(async (row) => {
-					const stub = getRunStub(config.runs, row.run_id as string);
 					try {
-						return await doFetch<Hook>(
-							stub,
-							`/hooks/${encodeURIComponent(row.hook_id as string)}?resolveData=${resolveData}`,
+						return await fetchHook(
+							row.run_id as string,
+							row.hook_id as string,
+							params,
 						);
 					} catch {
 						return {
@@ -332,27 +326,15 @@ function createHooksStorage(config: CloudflareWorldConfig): Storage["hooks"] {
 
 function createStepsStorage(config: CloudflareWorldConfig): Storage["steps"] {
 	return {
-		get: (async (
-			runId: string | undefined,
-			stepId: string,
-			params?: GetStepParams,
-		) => {
-			if (!runId) {
-				throw new WorkflowAPIError(
-					"runId is required for Cloudflare world step lookups",
-					{ status: 400 },
-				);
-			}
-			const stub = getRunStub(config.runs, runId);
+		get: (async (runId: string, stepId: string, params?: GetStepParams) => {
 			const resolveData = params?.resolveData ?? "all";
 			return doFetch<Step | StepWithoutData>(
-				stub,
+				getRunStub(config.runs, runId),
 				`/steps/${encodeURIComponent(stepId)}?resolveData=${resolveData}`,
 			);
 		}) as Storage["steps"]["get"],
 
 		list: (async (params: ListWorkflowRunStepsParams) => {
-			const stub = getRunStub(config.runs, params.runId);
 			const qs = new URLSearchParams({
 				limit: String(params.pagination?.limit ?? 20),
 				resolveData: params.resolveData ?? "all",
@@ -361,7 +343,7 @@ function createStepsStorage(config: CloudflareWorldConfig): Storage["steps"] {
 				qs.set("cursor", params.pagination.cursor);
 			}
 			return doFetch<PaginatedResponse<Step | StepWithoutData>>(
-				stub,
+				getRunStub(config.runs, params.runId),
 				`/steps?${qs}`,
 			);
 		}) as Storage["steps"]["list"],

@@ -38,6 +38,7 @@
 		"check": "biome check .",
 		"check:fix": "biome check --write .",
 		"test": "vitest run",
+		"test:conformance": "vitest run --config vitest.conformance.config.ts",
 		"typecheck": "tsc --noEmit",
 		"prepublishOnly": "npm run check && npm run test && npm run build"
 	},
@@ -46,12 +47,14 @@
 		"@cloudflare/workers-types": "^4.20260317.1",
 		"@types/node": "^24.0.0",
 		"@vercel/ncc": "^0.38.4",
-		"@workflow/errors": "^4.1.0-beta.18",
-		"@workflow/world": "^4.1.0-beta.13",
-		"@workflow/world-local": "^4.1.0-beta.44",
+		"@workflow/errors": "^5.0.4",
+		"@workflow/utils": "^5.0.2",
+		"@workflow/world": "^5.0.4",
+		"@workflow/world-testing": "^5.0.5",
 		"typescript": "^5.9.3",
-		"ulid": "^2.4.0",
+		"ulid": "^3.0.1",
 		"vitest": "^4.1.0",
+		"workflow": "^5.2.2",
 		"zod": "^4.3.6"
 	},
 	"keywords": [

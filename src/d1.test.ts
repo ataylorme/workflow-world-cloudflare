@@ -2,7 +2,6 @@ import { describe, expect, it, vi } from "vitest";
 import {
 	deleteHookIndex,
 	deleteHooksForRunIndex,
-	insertHookIndex,
 	upsertRunIndex,
 } from "./d1.js";
 
@@ -32,24 +31,6 @@ describe("d1 index helpers", () => {
 		});
 		expect(db.prepare).toHaveBeenCalledWith(
 			expect.stringContaining("INSERT INTO workflow_runs_index"),
-		);
-	});
-
-	it("inserts a hook index row", async () => {
-		const db = createMockDb();
-		await insertHookIndex(db, {
-			hookId: "hook_01ABC",
-			runId: "wrun_01ABC",
-			token: "tok_secret",
-			ownerId: "owner1",
-			projectId: "proj1",
-			environment: "production",
-			createdAt: "2024-01-01T00:00:00.000Z",
-			isWebhook: true,
-			specVersion: 2,
-		});
-		expect(db.prepare).toHaveBeenCalledWith(
-			expect.stringContaining("INSERT OR IGNORE INTO workflow_hooks_index"),
 		);
 	});
 

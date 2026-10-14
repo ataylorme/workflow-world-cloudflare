@@ -1,4 +1,4 @@
-import type { World } from "@workflow/world";
+import { mintedSpecVersion, type World } from "@workflow/world";
 import type { CloudflareWorldConfig } from "./config.js";
 import { type CloudflareQueue, createQueue } from "./queue.js";
 import { createStorage } from "./storage.js";
@@ -12,7 +12,8 @@ export type CloudflareWorld = World & {
 /**
  * Creates a Cloudflare Workers world implementation using:
  * - Durable Objects for per-run state (events, steps, hooks, waits, streams)
- * - D1 for cross-run index queries (runs.list, hooks.getByToken)
+ * - D1 for cross-run index queries (runs.list, hooks.getByToken) and hook
+ *   token uniqueness
  * - Cloudflare Queues for message dispatch
  */
 export function createWorld(config: CloudflareWorldConfig): CloudflareWorld {
@@ -21,6 +22,14 @@ export function createWorld(config: CloudflareWorldConfig): CloudflareWorld {
 	const streamer = createStreamer(config);
 
 	return {
+		// Read per call, so `WORKFLOW_SEALED_LOG=0` takes effect without a
+		// rebuild. A Worker has no `process.env` unless `nodejs_compat` is on.
+		specVersion: mintedSpecVersion(
+			config.env ??
+				(globalThis as { process?: { env?: Record<string, string> } }).process
+					?.env ??
+				{},
+		),
 		...storage,
 		...queue,
 		...streamer,
@@ -30,4 +39,8 @@ export function createWorld(config: CloudflareWorldConfig): CloudflareWorld {
 export type { CloudflareWorldConfig } from "./config.js";
 export { migrate } from "./d1.js";
 export { WorkflowRunDO } from "./durable-object.js";
-export type { CloudflareQueue } from "./queue.js";
+export type {
+	CloudflareQueue,
+	HandleQueueBatchOptions,
+	QueueMessageEnvelope,
+} from "./queue.js";
