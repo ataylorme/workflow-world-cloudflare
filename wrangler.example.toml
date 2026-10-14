@@ -5,7 +5,10 @@
 
 name = "my-workflow-worker"
 main = "src/worker.ts"
-compatibility_date = "2024-12-01"
+compatibility_date = "2025-04-01"
+# The bundle uses node:crypto (ULID generation); from 2025-04-01 this flag
+# also populates process.env from your vars.
+compatibility_flags = ["nodejs_compat"]
 
 # Durable Objects — one DO class per workflow run
 [durable_objects]

@@ -1,40 +1,58 @@
 import {
+	EntityConflictError,
 	HookNotFoundError,
+	RunExpiredError,
 	RunNotSupportedError,
-	WorkflowAPIError,
+	TooEarlyError,
+	WorkflowRunNotFoundError,
+	WorkflowWorldError,
 } from "@workflow/errors";
 import type {
+	CreateEventParams,
 	Event,
 	EventResult,
+	EventsResolveData,
 	Hook,
 	PaginatedResponse,
 	ResolveData,
 	Step,
 	StepWithoutData,
+	StreamChunksResponse,
+	StreamInfoResponse,
 	Wait,
 	WorkflowRun,
 	WorkflowRunWithoutData,
 } from "@workflow/world";
 import {
+	applyAttributeChanges,
 	EventSchema,
+	FIRST_EVENT_SLOT,
 	HookSchema,
+	isChildEntityCreationEvent,
+	isHookEventRequiringExistence,
 	isLegacySpecVersion,
+	isStepEventType,
+	isTerminalRunEventType,
+	isTerminalStepStatus,
+	isTerminalWorkflowRunStatus,
 	requiresNewerWorld,
 	SPEC_VERSION_CURRENT,
 	StepSchema,
+	slotToEventId,
+	stripEventDataRefs,
+	validateAttributeChanges,
 	validateUlidTimestamp,
 	WorkflowRunSchema,
 } from "@workflow/world";
-import { monotonicFactory } from "ulid";
+import { decode, encode, statusForError, toErrorEnvelope } from "./codec.js";
 import {
+	claimHookToken,
 	deleteHookIndex,
 	deleteHooksForRunIndex,
-	insertHookIndex,
+	type HookTokenClaim,
 	upsertRunIndex,
 } from "./d1.js";
 import { toISOOrUndef } from "./util.js";
-
-const ulid = monotonicFactory();
 
 // ============================================================
 // Data filtering helpers (strip data for resolveData='none')
@@ -70,33 +88,111 @@ function filterHookData(hook: Hook, resolveData: ResolveData): Hook {
 	return hook;
 }
 
-function filterEventData(event: Event, resolveData: ResolveData): Event {
-	if (resolveData === "none" && "eventData" in event) {
-		const { eventData: _, ...rest } = event;
-		return rest as Event;
-	}
-	return event;
+/** `skip-step-inputs` is a read hint; anything other than 'none' returns data. */
+function entityResolve(
+	resolveData: EventsResolveData | undefined,
+): ResolveData {
+	return resolveData === "none" ? "none" : "all";
 }
 
 // ============================================================
-// DO storage key prefixes
+// DO storage keys
 // ============================================================
+
+/**
+ * Highest event slot committed in this run's log. Event `n` lives under
+ * `KEY.event(slotToEventId(n))`; `slotToEventId` pads to a fixed width, so a
+ * prefix listing returns events in slot order.
+ */
+const SEQ_KEY = "seq";
+
 const KEY = {
 	run: "run",
-	event: (id: string) => `evt:${id}`,
+	event: (eventId: string) => `evt:${eventId}`,
 	step: (id: string) => `step:${id}`,
 	hook: (id: string) => `hook:${id}`,
-	hookToken: (token: string) => `hook_tok:${token}`,
+	/** The eventId of a hook's `hook_created`, so a retry converges on it. */
+	hookCreated: (id: string) => `hook_evt:${id}`,
 	wait: (id: string) => `wait:${id}`,
-	streamChunk: (streamId: string, chunkId: string) =>
-		`strm:${streamId}:chnk:${chunkId}`,
-	streamMeta: (streamId: string) => `strm:${streamId}:meta`,
+	/** `(runId, resumeId)` claim for `hook_received` redelivery convergence. */
+	resume: (resumeId: string) => `resume:${resumeId}`,
+	/** Dedup for workflow-written `attr_set` events, keyed by correlation id. */
+	attr: (correlationId: string) => `attr:${correlationId}`,
+	streamChunk: (name: string, index: number) =>
+		`strm:${name}:chnk:${String(index).padStart(12, "0")}`,
+	streamMeta: (name: string) => `strm:${name}:meta`,
 	streamIndex: "strm_idx",
 } as const;
 
-interface StreamChunkData {
-	data: number[];
-	eof: boolean;
+const DEFAULT_EVENTS_PAGE = 1000;
+const MAX_EVENTS_PAGE = 10_000;
+
+interface StreamMeta {
+	count: number;
+	done: boolean;
+}
+
+interface ResumeClaim {
+	hookId: string;
+	eventId: string;
+	payloadDigest?: string;
+}
+
+/**
+ * Writes made while processing one event, committed together.
+ *
+ * Every `put` and `delete` is issued in one synchronous burst at `commit()`
+ * with no `await` between them, which a Durable Object commits as a single
+ * atomic write (write coalescing). The event row, the slot counter and every
+ * entity it changes therefore become durable together or not at all, and
+ * reads through `get`/`list` see the staged state first.
+ */
+class Staged {
+	private puts = new Map<string, unknown>();
+	private dels = new Set<string>();
+
+	constructor(private storage: DurableObjectStorage) {}
+
+	async get<T>(key: string): Promise<T | undefined> {
+		if (this.dels.has(key)) return undefined;
+		if (this.puts.has(key)) return this.puts.get(key) as T;
+		return this.storage.get<T>(key);
+	}
+
+	put(key: string, value: unknown): void {
+		this.dels.delete(key);
+		this.puts.set(key, value);
+	}
+
+	delete(key: string): void {
+		this.puts.delete(key);
+		this.dels.add(key);
+	}
+
+	async list<T>(prefix: string): Promise<Map<string, T>> {
+		const stored = await this.storage.list<T>({ prefix });
+		const merged = new Map<string, T>();
+		for (const [k, v] of stored) {
+			if (!this.dels.has(k)) merged.set(k, v);
+		}
+		for (const [k, v] of this.puts) {
+			if (k.startsWith(prefix)) merged.set(k, v as T);
+		}
+		return merged;
+	}
+
+	async commit(): Promise<void> {
+		const ops: Promise<unknown>[] = [];
+		const puts = [...this.puts.entries()];
+		for (let i = 0; i < puts.length; i += 128) {
+			ops.push(this.storage.put(Object.fromEntries(puts.slice(i, i + 128))));
+		}
+		const dels = [...this.dels];
+		for (let i = 0; i < dels.length; i += 128) {
+			ops.push(this.storage.delete(dels.slice(i, i + 128)));
+		}
+		await Promise.all(ops);
+	}
 }
 
 // ============================================================
@@ -107,265 +203,311 @@ interface Env {
 	WORKFLOW_DB: D1Database;
 }
 
+interface CreateEventBody {
+	runId: string;
+	data: Record<string, unknown> & { eventType: string };
+	params?: Omit<CreateEventParams, "replayEventObserver">;
+}
+
 export class WorkflowRunDO implements DurableObject {
 	private storage: DurableObjectStorage;
 	private db: D1Database;
+	/**
+	 * Tail of the mutation chain. This instance is the only writer of its
+	 * run's storage anywhere, so ordering mutations here orders every writer
+	 * of the run: one `events.create` finishes (slot drawn and committed)
+	 * before the next starts reading.
+	 */
+	private chain: Promise<unknown> = Promise.resolve();
+	/** Readers tailing a stream, woken on every write and close. */
+	private streamWaiters = new Map<string, Set<() => void>>();
 
 	constructor(state: DurableObjectState, env: Env) {
 		this.storage = state.storage;
 		this.db = env.WORKFLOW_DB;
 	}
 
+	private serialize<T>(fn: () => Promise<T>): Promise<T> {
+		const next = this.chain.then(fn, fn);
+		this.chain = next.catch(() => {});
+		return next;
+	}
+
 	async fetch(request: Request): Promise<Response> {
 		const url = new URL(request.url);
 		const method = request.method;
 		const path = url.pathname;
+		const q = url.searchParams;
+		const body = async <T>() => decode<T>(await request.text());
+		const json = (value: unknown) =>
+			new Response(encode(value), {
+				headers: { "content-type": "application/json" },
+			});
 
 		try {
-			// POST /events — create event
 			if (method === "POST" && path === "/events") {
-				const body = (await request.json()) as {
-					runId: string | null;
-					data: Record<string, unknown>;
-					params?: Record<string, unknown>;
-				};
-				const result = await this.createEvent(
-					body.runId,
-					body.data,
-					body.params,
+				const { runId, data, params } = await body<CreateEventBody>();
+				return json(
+					await this.serialize(() => this.createEvent(runId, data, params)),
 				);
-				return Response.json(result);
 			}
 
-			// GET /run — get run entity
 			if (method === "GET" && path === "/run") {
-				const resolveData =
-					(url.searchParams.get("resolveData") as ResolveData) ?? "all";
-				const run = await this.getRun(resolveData);
-				return Response.json(run);
-			}
-
-			// GET /events — list events
-			if (method === "GET" && path === "/events") {
-				const result = await this.listEvents({
-					limit: Number.parseInt(url.searchParams.get("limit") ?? "100", 10),
-					cursor: url.searchParams.get("cursor") ?? undefined,
-					sortOrder:
-						(url.searchParams.get("sortOrder") as "asc" | "desc") ?? "asc",
-					resolveData:
-						(url.searchParams.get("resolveData") as ResolveData) ?? "all",
-				});
-				return Response.json(result);
-			}
-
-			// GET /events/:eventId — get single event
-			if (method === "GET" && path.startsWith("/events/")) {
-				const eventId = path.slice("/events/".length);
-				const resolveData =
-					(url.searchParams.get("resolveData") as ResolveData) ?? "all";
-				const event = await this.getEvent(eventId, resolveData);
-				return Response.json(event);
-			}
-
-			// GET /events-by-correlation — list events by correlation ID
-			if (method === "GET" && path === "/events-by-correlation") {
-				const result = await this.listEventsByCorrelationId({
-					correlationId: url.searchParams.get("correlationId") ?? "",
-					limit: Number.parseInt(url.searchParams.get("limit") ?? "100", 10),
-					cursor: url.searchParams.get("cursor") ?? undefined,
-					sortOrder:
-						(url.searchParams.get("sortOrder") as "asc" | "desc") ?? "asc",
-					resolveData:
-						(url.searchParams.get("resolveData") as ResolveData) ?? "all",
-				});
-				return Response.json(result);
-			}
-
-			// GET /steps — list steps
-			if (method === "GET" && path === "/steps") {
-				const result = await this.listSteps({
-					limit: Number.parseInt(url.searchParams.get("limit") ?? "20", 10),
-					cursor: url.searchParams.get("cursor") ?? undefined,
-					resolveData:
-						(url.searchParams.get("resolveData") as ResolveData) ?? "all",
-				});
-				return Response.json(result);
-			}
-
-			// GET /steps/:stepId — get single step
-			if (method === "GET" && path.startsWith("/steps/")) {
-				const stepId = path.slice("/steps/".length);
-				const resolveData =
-					(url.searchParams.get("resolveData") as ResolveData) ?? "all";
-				const step = await this.getStep(stepId, resolveData);
-				return Response.json(step);
-			}
-
-			// GET /hooks — list hooks
-			if (method === "GET" && path === "/hooks") {
-				const result = await this.listHooks({
-					limit: Number.parseInt(url.searchParams.get("limit") ?? "100", 10),
-					cursor: url.searchParams.get("cursor") ?? undefined,
-					sortOrder:
-						(url.searchParams.get("sortOrder") as "asc" | "desc") ?? "asc",
-					resolveData:
-						(url.searchParams.get("resolveData") as ResolveData) ?? "all",
-				});
-				return Response.json(result);
-			}
-
-			// GET /hooks/:hookId — get single hook
-			if (method === "GET" && path.startsWith("/hooks/")) {
-				const hookId = path.slice("/hooks/".length);
-				const resolveData =
-					(url.searchParams.get("resolveData") as ResolveData) ?? "all";
-				const hook = await this.getHook(hookId, resolveData);
-				return Response.json(hook);
-			}
-
-			// POST /streams/:name/write — write stream chunk
-			if (method === "POST" && path.match(/^\/streams\/[^/]+\/write$/)) {
-				const name = path.split("/")[2];
-				const body = (await request.json()) as {
-					chunk: number[] | string;
-					runId: string;
-				};
-				await this.writeStreamChunk(name, body.chunk, body.runId);
-				return new Response(null, { status: 204 });
-			}
-
-			// POST /streams/:name/write-multi — write multiple stream chunks
-			if (method === "POST" && path.match(/^\/streams\/[^/]+\/write-multi$/)) {
-				const name = path.split("/")[2];
-				const body = (await request.json()) as {
-					chunks: (number[] | string)[];
-					runId: string;
-				};
-				await this.writeStreamChunks(name, body.chunks, body.runId);
-				return new Response(null, { status: 204 });
-			}
-
-			// POST /streams/:name/close — close stream
-			if (method === "POST" && path.match(/^\/streams\/[^/]+\/close$/)) {
-				const name = path.split("/")[2];
-				const body = (await request.json()) as { runId: string };
-				await this.closeStream(name, body.runId);
-				return new Response(null, { status: 204 });
-			}
-
-			// GET /streams/:name/read — read stream
-			if (method === "GET" && path.match(/^\/streams\/[^/]+\/read$/)) {
-				const name = path.split("/")[2];
-				const startIndex = Number.parseInt(
-					url.searchParams.get("startIndex") ?? "0",
-					10,
+				return json(
+					await this.getRun(
+						q.get("runId") ?? "",
+						(q.get("resolveData") as ResolveData) ?? "all",
+					),
 				);
-				const stream = await this.readStream(name, startIndex);
-				return new Response(stream, {
-					headers: { "Content-Type": "application/octet-stream" },
-				});
 			}
 
-			// GET /streams — list stream names
+			if (method === "GET" && path === "/events") {
+				return json(
+					await this.listEvents({
+						limit: Number.parseInt(q.get("limit") ?? "", 10) || undefined,
+						cursor: q.get("cursor") ?? undefined,
+						sortOrder: (q.get("sortOrder") as "asc" | "desc") ?? "asc",
+						resolveData: (q.get("resolveData") as EventsResolveData) ?? "all",
+						correlationId: q.get("correlationId") ?? undefined,
+					}),
+				);
+			}
+
+			if (method === "GET" && path.startsWith("/events/")) {
+				const eventId = decodeURIComponent(path.slice("/events/".length));
+				return json(
+					await this.getEvent(
+						eventId,
+						(q.get("resolveData") as ResolveData) ?? "all",
+					),
+				);
+			}
+
+			if (method === "GET" && path === "/steps") {
+				return json(
+					await this.listSteps({
+						limit: Number.parseInt(q.get("limit") ?? "20", 10),
+						cursor: q.get("cursor") ?? undefined,
+						resolveData: (q.get("resolveData") as ResolveData) ?? "all",
+					}),
+				);
+			}
+
+			if (method === "GET" && path.startsWith("/steps/")) {
+				const stepId = decodeURIComponent(path.slice("/steps/".length));
+				return json(
+					await this.getStep(
+						stepId,
+						(q.get("resolveData") as ResolveData) ?? "all",
+					),
+				);
+			}
+
+			if (method === "GET" && path === "/hooks") {
+				return json(
+					await this.listHooks({
+						limit: Number.parseInt(q.get("limit") ?? "100", 10),
+						cursor: q.get("cursor") ?? undefined,
+						sortOrder: (q.get("sortOrder") as "asc" | "desc") ?? "asc",
+						resolveData: (q.get("resolveData") as ResolveData) ?? "all",
+					}),
+				);
+			}
+
+			if (method === "GET" && path.startsWith("/hooks/")) {
+				const hookId = decodeURIComponent(path.slice("/hooks/".length));
+				return json(
+					await this.getHook(
+						hookId,
+						(q.get("resolveData") as ResolveData) ?? "all",
+					),
+				);
+			}
+
+			const streamMatch = path.match(/^\/streams\/([^/]+)\/([a-z-]+)$/);
+			if (streamMatch) {
+				const name = decodeURIComponent(streamMatch[1]);
+				const action = streamMatch[2];
+				if (method === "POST" && action === "write") {
+					const { chunks } = await body<{ chunks: Uint8Array[] }>();
+					await this.serialize(() => this.writeStreamChunks(name, chunks));
+					return new Response(null, { status: 204 });
+				}
+				if (method === "POST" && action === "close") {
+					await this.serialize(() => this.closeStream(name));
+					return new Response(null, { status: 204 });
+				}
+				if (method === "GET" && action === "read") {
+					const stream = await this.readStream(
+						name,
+						Number.parseInt(q.get("startIndex") ?? "0", 10) || 0,
+					);
+					return new Response(stream, {
+						headers: { "content-type": "application/octet-stream" },
+					});
+				}
+				if (method === "GET" && action === "chunks") {
+					return json(
+						await this.getStreamChunks(name, {
+							limit: Number.parseInt(q.get("limit") ?? "100", 10),
+							cursor: q.get("cursor") ?? undefined,
+						}),
+					);
+				}
+				if (method === "GET" && action === "info") {
+					return json(await this.getStreamInfo(name));
+				}
+			}
+
 			if (method === "GET" && path === "/streams") {
-				const names = await this.listStreams();
-				return Response.json(names);
+				return json(await this.listStreams());
 			}
 
 			return new Response("Not Found", { status: 404 });
 		} catch (err: unknown) {
-			const error = err as {
-				message?: string;
-				status?: number;
-				statusCode?: number;
-				code?: string;
-				meta?: unknown;
-			};
-			const status = error.status ?? error.statusCode ?? 500;
-			return Response.json(
-				{
-					error: error.message,
-					code: error.code,
-					meta: error.meta,
-				},
-				{ status },
-			);
+			const envelope = toErrorEnvelope(err);
+			return new Response(encode({ error: envelope }), {
+				status: statusForError(envelope),
+				headers: { "content-type": "application/json" },
+			});
 		}
 	}
 
 	// ============================================================
-	// Run CRUD
+	// Run reads
 	// ============================================================
 
 	private async getRun(
+		runId: string,
 		resolveData: ResolveData,
 	): Promise<WorkflowRun | WorkflowRunWithoutData> {
 		const run = await this.storage.get<WorkflowRun>(KEY.run);
 		if (!run) {
-			throw new WorkflowAPIError("Run not found", { status: 404 });
+			throw new WorkflowRunNotFoundError(runId);
 		}
-		const parsed = WorkflowRunSchema.parse(run);
-		return filterRunData(parsed, resolveData);
+		return filterRunData(WorkflowRunSchema.parse(run), resolveData);
 	}
 
 	// ============================================================
-	// Event processing — core logic ported from world-postgres
+	// Event processing
 	// ============================================================
 
+	/**
+	 * Append one event and apply it to the run's entities.
+	 *
+	 * Runs inside `serialize()`, so the slot drawn here is `seq + 1` with no
+	 * competing writer, and it is committed in the same atomic write as the
+	 * event (see `Staged`). That makes the log dense by construction: a
+	 * rejected write commits nothing, and nothing can be appended behind a
+	 * slot a reader has already passed.
+	 */
 	private async createEvent(
-		runId: string | null,
-		data: Record<string, unknown>,
-		params?: Record<string, unknown>,
+		runId: string,
+		data: CreateEventBody["data"],
+		params?: CreateEventBody["params"],
 	): Promise<EventResult> {
-		const eventId = `wevt_${ulid()}`;
-		const resolveData = (params?.resolveData as ResolveData) ?? "all";
+		const tx = new Staged(this.storage);
+		const now = new Date();
+		const resolveData = params?.resolveData ?? "all";
+		const effectiveSpecVersion =
+			(data.specVersion as number | undefined) ?? SPEC_VERSION_CURRENT;
+		const correlationId = data.correlationId as string | undefined;
 
-		// For run_created: generate runId if not provided
-		let effectiveRunId: string;
-		if (data.eventType === "run_created" && (!runId || runId === "")) {
-			effectiveRunId = `wrun_${ulid()}`;
-		} else if (!runId) {
-			throw new Error("runId is required for non-run_created events");
-		} else {
-			effectiveRunId = runId;
-		}
-
-		// Validate client-provided runId timestamp
-		if (data.eventType === "run_created" && runId && runId !== "") {
-			const validationError = validateUlidTimestamp(effectiveRunId, "wrun_");
+		if (data.eventType === "run_created") {
+			const validationError = validateUlidTimestamp(runId, "wrun_");
 			if (validationError) {
-				throw new WorkflowAPIError(validationError, { status: 400 });
+				throw new WorkflowWorldError(validationError, { status: 400 });
 			}
 		}
 
-		const effectiveSpecVersion =
-			(data.specVersion as number) ?? SPEC_VERSION_CURRENT;
-		const now = new Date();
+		let seq = (await tx.get<number>(SEQ_KEY)) ?? 0;
+		/** Append an event at the next slot. */
+		const append = (event: Omit<Event, "eventId">): Event => {
+			seq += 1;
+			const stored = EventSchema.parse({
+				...event,
+				eventId: slotToEventId(seq),
+			});
+			tx.put(KEY.event(stored.eventId), stored);
+			tx.put(SEQ_KEY, seq);
+			return stored;
+		};
 
-		let run: WorkflowRun | undefined;
-		let step: Step | undefined;
-		let hook: Hook | undefined;
-		let wait: Wait | undefined;
+		let currentRun =
+			data.eventType === "run_created"
+				? undefined
+				: await tx.get<WorkflowRun>(KEY.run);
 
-		const isRunTerminal = (status: string) =>
-			["completed", "failed", "cancelled"].includes(status);
-		const isStepTerminal = (status: string) =>
-			["completed", "failed"].includes(status);
-
-		// ============================================================
-		// VALIDATION
-		// ============================================================
-
-		let currentRun: WorkflowRun | undefined;
-		const skipRunValidationEvents = ["step_completed", "step_retrying"];
-		if (
-			data.eventType !== "run_created" &&
-			!skipRunValidationEvents.includes(data.eventType as string)
-		) {
-			currentRun = await this.storage.get<WorkflowRun>(KEY.run);
+		if (currentRun && (await this.storage.get(SEQ_KEY)) === undefined) {
+			// A run written by the v4 version of this World: its events are
+			// ULID-numbered, which the v5 runtime cannot replay. See README.
+			throw new RunNotSupportedError(
+				currentRun.specVersion ?? 0,
+				SPEC_VERSION_CURRENT,
+			);
 		}
 
-		// Version compatibility check
+		// Resilient start: a run_started for a run whose run_created never
+		// landed carries the creation data, so the run is created here, with
+		// its run_created taking the earlier slot so it replays first.
+		if (data.eventType === "run_started" && !currentRun && data.eventData) {
+			const input = data.eventData as {
+				deploymentId?: string;
+				workflowName?: string;
+				input?: unknown;
+				executionContext?: Record<string, unknown>;
+				attributes?: Record<string, string>;
+				allowReservedAttributes?: true;
+				encryptionPublicKey?: string;
+			};
+			if (
+				input.deploymentId &&
+				input.workflowName &&
+				input.input !== undefined
+			) {
+				validateAttributeChanges(
+					Object.entries(input.attributes ?? {}).map(([key, value]) => ({
+						key,
+						value,
+					})),
+					{ allowReservedAttributes: input.allowReservedAttributes === true },
+				);
+				currentRun = WorkflowRunSchema.parse({
+					runId,
+					deploymentId: input.deploymentId,
+					workflowName: input.workflowName,
+					specVersion: effectiveSpecVersion,
+					executionContext: input.executionContext,
+					input: input.input,
+					attributes: input.attributes ?? {},
+					encryptionPublicKey: input.encryptionPublicKey,
+					status: "pending",
+					createdAt: now,
+					updatedAt: now,
+				});
+				tx.put(KEY.run, currentRun);
+				append({
+					eventType: "run_created",
+					runId,
+					createdAt: now,
+					specVersion: effectiveSpecVersion,
+					eventData: {
+						deploymentId: input.deploymentId,
+						workflowName: input.workflowName,
+						input: input.input,
+						executionContext: input.executionContext,
+						attributes: input.attributes,
+						allowReservedAttributes: input.allowReservedAttributes,
+						encryptionPublicKey: input.encryptionPublicKey,
+					},
+				} as Omit<Event, "eventId">);
+			}
+		}
+
+		if (data.eventType !== "run_created" && !currentRun) {
+			throw new WorkflowRunNotFoundError(runId);
+		}
+
 		if (currentRun) {
 			if (requiresNewerWorld(currentRun.specVersion)) {
 				throw new RunNotSupportedError(
@@ -373,105 +515,127 @@ export class WorkflowRunDO implements DurableObject {
 					SPEC_VERSION_CURRENT,
 				);
 			}
-
 			if (isLegacySpecVersion(currentRun.specVersion)) {
-				return this.handleLegacyEvent(
-					effectiveRunId,
-					eventId,
-					data,
-					currentRun,
-					params,
-				);
+				return this.handleLegacyEvent(tx, runId, data, currentRun, append);
 			}
 		}
 
-		// Run terminal state validation
-		if (currentRun && isRunTerminal(currentRun.status)) {
-			const runTerminalEvents = ["run_started", "run_completed", "run_failed"];
+		// ============================================================
+		// VALIDATION
+		// ============================================================
 
-			// Idempotent: run_cancelled on already cancelled run
+		const createsChildEntity = isChildEntityCreationEvent(data as never);
+		const lazyStepStart =
+			createsChildEntity && data.eventType === "step_started";
+
+		if (currentRun && isTerminalWorkflowRunStatus(currentRun.status)) {
 			if (
 				data.eventType === "run_cancelled" &&
 				currentRun.status === "cancelled"
 			) {
-				const event = await this.insertEvent(
-					effectiveRunId,
-					eventId,
-					data,
-					effectiveSpecVersion,
-				);
-				return {
-					event: filterEventData(event, resolveData),
-					run: filterRunData(currentRun, resolveData) as WorkflowRun,
-				};
+				const event = append({
+					...data,
+					runId,
+					createdAt: now,
+					specVersion: effectiveSpecVersion,
+				} as Omit<Event, "eventId">);
+				await tx.commit();
+				return this.finish(runId, event, { run: currentRun }, params, seq);
 			}
-
-			if (
-				runTerminalEvents.includes(data.eventType as string) ||
-				data.eventType === "run_cancelled"
-			) {
-				throw new WorkflowAPIError(
+			if (data.eventType === "run_started") {
+				throw new RunExpiredError(
+					`Workflow run "${runId}" is already in terminal state "${currentRun.status}"`,
+					runId,
+					currentRun.status,
+				);
+			}
+			if (isTerminalRunEventType(data.eventType)) {
+				throw new EntityConflictError(
 					`Cannot transition run from terminal state "${currentRun.status}"`,
-					{ status: 409 },
 				);
 			}
-
-			if (
-				data.eventType === "step_created" ||
-				data.eventType === "hook_created" ||
-				data.eventType === "wait_created"
-			) {
-				throw new WorkflowAPIError(
+			if (createsChildEntity) {
+				throw new EntityConflictError(
 					`Cannot create new entities on run in terminal state "${currentRun.status}"`,
-					{ status: 409 },
+				);
+			}
+			if (data.eventType === "attr_set") {
+				throw new EntityConflictError(
+					`Cannot set attributes on run in terminal state "${currentRun.status}"`,
 				);
 			}
 		}
 
-		// Step validation for step_started, step_retrying
 		let validatedStep: Step | undefined;
-		const stepEventsNeedingValidation = ["step_started", "step_retrying"];
 		if (
-			stepEventsNeedingValidation.includes(data.eventType as string) &&
-			data.correlationId
+			isStepEventType(data.eventType) &&
+			data.eventType !== "step_created" &&
+			correlationId
 		) {
-			validatedStep = await this.storage.get<Step>(
-				KEY.step(data.correlationId as string),
-			);
-			if (!validatedStep) {
-				throw new WorkflowAPIError(`Step "${data.correlationId}" not found`, {
+			validatedStep = await tx.get<Step>(KEY.step(correlationId));
+			if (!validatedStep && !lazyStepStart) {
+				throw new WorkflowWorldError(`Step "${correlationId}" not found`, {
 					status: 404,
 				});
 			}
-			if (isStepTerminal(validatedStep.status)) {
-				throw new WorkflowAPIError(
-					`Cannot modify step in terminal state "${validatedStep.status}"`,
-					{ status: 409 },
+			if (lazyStepStart && validatedStep) {
+				// Another handler already created this step: it owns the body.
+				throw new EntityConflictError(
+					`Step "${correlationId}" already created`,
 				);
 			}
-			if (currentRun && isRunTerminal(currentRun.status)) {
-				if (validatedStep.status !== "running") {
-					throw new WorkflowAPIError(
-						`Cannot modify non-running step on run in terminal state "${currentRun.status}"`,
-						{ status: 410 },
+			if (validatedStep) {
+				if (isTerminalStepStatus(validatedStep.status)) {
+					throw new EntityConflictError(
+						`Cannot modify step in terminal state "${validatedStep.status}"`,
+					);
+				}
+				// A step_started on a finished run is a redelivery of a start some
+				// earlier delivery already claimed: refuse it even when the step
+				// still reads `running`, so the body does not run a second time
+				// for an outcome nothing will read.
+				if (
+					currentRun &&
+					isTerminalWorkflowRunStatus(currentRun.status) &&
+					(validatedStep.status !== "running" ||
+						data.eventType === "step_started")
+				) {
+					throw new RunExpiredError(
+						`Cannot ${data.eventType === "step_started" ? "start" : "modify non-running"} step on run in terminal state "${currentRun.status}"`,
+						runId,
+						currentRun.status,
 					);
 				}
 			}
 		}
 
-		// Hook validation for hook_disposed, hook_received
-		const hookEventsRequiringExistence = ["hook_disposed", "hook_received"];
-		if (
-			hookEventsRequiringExistence.includes(data.eventType as string) &&
-			data.correlationId
-		) {
-			const existingHook = await this.storage.get<Hook>(
-				KEY.hook(data.correlationId as string),
-			);
+		if (isHookEventRequiringExistence(data.eventType) && correlationId) {
+			if (data.eventType === "hook_received" && params?.resumeId) {
+				const claim = await tx.get<ResumeClaim>(KEY.resume(params.resumeId));
+				if (claim) {
+					if (claim.hookId !== correlationId) {
+						throw new EntityConflictError(
+							`hook_received resumeId "${params.resumeId}" already recorded for a different hook`,
+						);
+					}
+					if (
+						params.resumePayloadDigest &&
+						claim.payloadDigest &&
+						claim.payloadDigest !== params.resumePayloadDigest
+					) {
+						throw new EntityConflictError(
+							`hook_received resumeId "${params.resumeId}" already recorded with a different payload`,
+						);
+					}
+					const committed = await tx.get<Event>(KEY.event(claim.eventId));
+					if (committed) {
+						return { event: stripEventDataRefs(committed, resolveData) };
+					}
+				}
+			}
+			const existingHook = await tx.get<Hook>(KEY.hook(correlationId));
 			if (!existingHook) {
-				throw new WorkflowAPIError(`Hook "${data.correlationId}" not found`, {
-					status: 404,
-				});
+				throw new HookNotFoundError(correlationId);
 			}
 		}
 
@@ -479,470 +643,574 @@ export class WorkflowRunDO implements DurableObject {
 		// Entity creation/updates
 		// ============================================================
 
-		if (data.eventType === "run_created") {
-			const eventData = data.eventData as {
-				deploymentId: string;
-				workflowName: string;
-				input: unknown;
-				executionContext?: Record<string, unknown>;
-			};
-			const newRun: WorkflowRun = WorkflowRunSchema.parse({
-				runId: effectiveRunId,
-				deploymentId: eventData.deploymentId,
-				workflowName: eventData.workflowName,
-				specVersion: effectiveSpecVersion,
-				input: eventData.input,
-				executionContext: eventData.executionContext,
-				status: "pending",
-				createdAt: now,
-				updatedAt: now,
-			});
-			await this.storage.put(KEY.run, newRun);
-			run = newRun;
+		let run: WorkflowRun | undefined;
+		let step: Step | undefined;
+		let hook: Hook | undefined;
+		let wait: Wait | undefined;
+		let stepCreatedLazily = false;
+		let releaseClaim: HookTokenClaim | undefined;
+		const terminalCleanup = async () => {
+			await this.disposeAllHooksAndWaits(tx);
+		};
 
-			// Update D1 index (fire-and-forget)
-			this.updateRunIndex(newRun);
-		}
+		const eventRow = {
+			...data,
+			runId,
+			createdAt: now,
+			specVersion: effectiveSpecVersion,
+			...(data.eventType === "hook_received" && params?.resumeId
+				? { resumeId: params.resumeId }
+				: {}),
+		} as Record<string, unknown>;
 
-		if (data.eventType === "run_started") {
-			const existing =
-				currentRun ?? (await this.storage.get<WorkflowRun>(KEY.run));
-			if (existing) {
-				const updated: WorkflowRun = WorkflowRunSchema.parse({
-					...existing,
-					status: "running",
-					startedAt: now,
+		switch (data.eventType) {
+			case "run_created": {
+				if (await tx.get(KEY.run)) {
+					throw new EntityConflictError(
+						`Workflow run "${runId}" already exists`,
+					);
+				}
+				const runData = data.eventData as {
+					deploymentId: string;
+					workflowName: string;
+					input: unknown;
+					executionContext?: Record<string, unknown>;
+					attributes?: Record<string, string>;
+					allowReservedAttributes?: true;
+					encryptionPublicKey?: string;
+					dynamicWorkflowCode?: unknown;
+				};
+				validateAttributeChanges(
+					Object.entries(runData.attributes ?? {}).map(([key, value]) => ({
+						key,
+						value,
+					})),
+					{ allowReservedAttributes: runData.allowReservedAttributes === true },
+				);
+				run = WorkflowRunSchema.parse({
+					runId,
+					deploymentId: runData.deploymentId,
+					workflowName: runData.workflowName,
+					specVersion: effectiveSpecVersion,
+					executionContext: runData.executionContext,
+					input: runData.input,
+					attributes: runData.attributes ?? {},
+					encryptionPublicKey: runData.encryptionPublicKey,
+					status: "pending",
+					createdAt: now,
 					updatedAt: now,
 				});
-				await this.storage.put(KEY.run, updated);
-				run = updated;
-				this.updateRunIndex(updated);
+				tx.put(KEY.run, run);
+				const {
+					dynamicWorkflowCode: _code,
+					dynamicWorkflowCodeRef: _ref,
+					...eventData
+				} = data.eventData as Record<string, unknown>;
+				eventRow.eventData = eventData;
+				break;
 			}
-		}
 
-		if (data.eventType === "run_completed") {
-			const eventData = data.eventData as { output?: unknown };
-			const existing =
-				currentRun ?? (await this.storage.get<WorkflowRun>(KEY.run));
-			if (existing) {
-				const updated: WorkflowRun = WorkflowRunSchema.parse({
+			case "run_started": {
+				const existing = currentRun as WorkflowRun;
+				if (existing.status === "running") {
+					// Idempotent for concurrent invocations: no second event.
+					const preload = params?.skipPreload
+						? undefined
+						: await this.readEvents({ limit: DEFAULT_EVENTS_PAGE }, tx);
+					await tx.commit();
+					if (!preload) return { run: existing };
+					return {
+						run: existing,
+						events: preload.data.map((e) => stripEventDataRefs(e, resolveData)),
+						cursor: preload.cursor,
+						hasMore: preload.hasMore,
+					};
+				}
+				run = WorkflowRunSchema.parse({
 					...existing,
+					status: "running",
+					startedAt: existing.startedAt ?? now,
+					updatedAt: now,
+				});
+				tx.put(KEY.run, run);
+				delete eventRow.eventData;
+				break;
+			}
+
+			case "run_completed": {
+				const eventData = data.eventData as { output?: unknown };
+				run = WorkflowRunSchema.parse({
+					...currentRun,
 					status: "completed",
 					output: eventData.output,
 					completedAt: now,
 					updatedAt: now,
 				});
-				await this.storage.put(KEY.run, updated);
-				run = updated;
-				this.updateRunIndex(updated);
-				await this.disposeAllHooksAndWaits(effectiveRunId);
+				tx.put(KEY.run, run);
+				await terminalCleanup();
+				break;
 			}
-		}
 
-		if (data.eventType === "run_failed") {
-			const eventData = data.eventData as {
-				error: unknown;
-				errorCode?: string;
-			};
-			const errorObj = eventData.error as Record<string, unknown> | string;
-			const errorMessage =
-				typeof errorObj === "string"
-					? errorObj
-					: ((errorObj?.message as string) ?? "Unknown error");
-			const existing =
-				currentRun ?? (await this.storage.get<WorkflowRun>(KEY.run));
-			if (existing) {
-				const updated: WorkflowRun = WorkflowRunSchema.parse({
-					...existing,
+			case "run_failed": {
+				const eventData = data.eventData as {
+					error: unknown;
+					errorCode?: string;
+				};
+				run = WorkflowRunSchema.parse({
+					...currentRun,
 					status: "failed",
-					error: {
-						message: errorMessage,
-						stack:
-							typeof errorObj === "object"
-								? (errorObj?.stack as string)
-								: undefined,
-						code: eventData.errorCode,
-					},
+					error: eventData.error,
+					errorCode: eventData.errorCode,
 					completedAt: now,
 					updatedAt: now,
 				});
-				await this.storage.put(KEY.run, updated);
-				run = updated;
-				this.updateRunIndex(updated);
-				await this.disposeAllHooksAndWaits(effectiveRunId);
-			}
-		}
-
-		if (data.eventType === "run_cancelled") {
-			const existing =
-				currentRun ?? (await this.storage.get<WorkflowRun>(KEY.run));
-			if (existing) {
-				const updated: WorkflowRun = WorkflowRunSchema.parse({
-					...existing,
-					status: "cancelled",
-					completedAt: now,
-					updatedAt: now,
-				});
-				await this.storage.put(KEY.run, updated);
-				run = updated;
-				this.updateRunIndex(updated);
-				await this.disposeAllHooksAndWaits(effectiveRunId);
-			}
-		}
-
-		if (data.eventType === "step_created") {
-			const eventData = data.eventData as {
-				stepName: string;
-				input: unknown;
-			};
-			const newStep: Step = StepSchema.parse({
-				runId: effectiveRunId,
-				stepId: data.correlationId,
-				stepName: eventData.stepName,
-				input: eventData.input,
-				status: "pending",
-				attempt: 0,
-				specVersion: effectiveSpecVersion,
-				createdAt: now,
-				updatedAt: now,
-			});
-			// Only create if doesn't exist (onConflictDoNothing equivalent)
-			const existing = await this.storage.get(
-				KEY.step(data.correlationId as string),
-			);
-			if (!existing) {
-				await this.storage.put(KEY.step(data.correlationId as string), newStep);
-				step = newStep;
-			}
-		}
-
-		if (data.eventType === "step_started") {
-			if (!validatedStep) {
-				throw new WorkflowAPIError(`Step "${data.correlationId}" not found`, {
-					status: 404,
-				});
+				tx.put(KEY.run, run);
+				await terminalCleanup();
+				break;
 			}
 
-			// Check retryAfter
-			if (
-				validatedStep.retryAfter &&
-				validatedStep.retryAfter.getTime() > Date.now()
-			) {
-				const err = new WorkflowAPIError(
-					`Cannot start step "${data.correlationId}": retryAfter timestamp has not been reached yet`,
-					{ status: 425 },
-				);
-				(err as unknown as { meta: unknown }).meta = {
-					stepId: data.correlationId,
-					retryAfter: validatedStep.retryAfter.toISOString(),
-				};
-				throw err;
-			}
-
-			const isFirstStart = !validatedStep.startedAt;
-			const updated: Step = StepSchema.parse({
-				...validatedStep,
-				status: "running",
-				attempt: validatedStep.attempt + 1,
-				...(isFirstStart ? { startedAt: now } : {}),
-				retryAfter: undefined,
-				updatedAt: now,
-			});
-			await this.storage.put(KEY.step(data.correlationId as string), updated);
-			step = updated;
-		}
-
-		if (data.eventType === "step_completed") {
-			const eventData = data.eventData as { result?: unknown };
-			const existingStep = await this.storage.get<Step>(
-				KEY.step(data.correlationId as string),
-			);
-			if (!existingStep) {
-				throw new WorkflowAPIError(`Step "${data.correlationId}" not found`, {
-					status: 404,
-				});
-			}
-			if (isStepTerminal(existingStep.status)) {
-				throw new WorkflowAPIError(
-					`Cannot modify step in terminal state "${existingStep.status}"`,
-					{ status: 409 },
-				);
-			}
-			const updated: Step = StepSchema.parse({
-				...existingStep,
-				status: "completed",
-				output: eventData.result,
-				completedAt: now,
-				updatedAt: now,
-			});
-			await this.storage.put(KEY.step(data.correlationId as string), updated);
-			step = updated;
-		}
-
-		if (data.eventType === "step_failed") {
-			const eventData = data.eventData as {
-				error?: unknown;
-				stack?: string;
-			};
-			const errorObj = eventData.error as Record<string, unknown> | string;
-			const errorMessage =
-				typeof errorObj === "string"
-					? errorObj
-					: ((errorObj?.message as string) ?? "Unknown error");
-			const existingStep = await this.storage.get<Step>(
-				KEY.step(data.correlationId as string),
-			);
-			if (!existingStep) {
-				throw new WorkflowAPIError(`Step "${data.correlationId}" not found`, {
-					status: 404,
-				});
-			}
-			if (isStepTerminal(existingStep.status)) {
-				throw new WorkflowAPIError(
-					`Cannot modify step in terminal state "${existingStep.status}"`,
-					{ status: 409 },
-				);
-			}
-			const updated: Step = StepSchema.parse({
-				...existingStep,
-				status: "failed",
-				error: { message: errorMessage, stack: eventData.stack },
-				completedAt: now,
-				updatedAt: now,
-			});
-			await this.storage.put(KEY.step(data.correlationId as string), updated);
-			step = updated;
-		}
-
-		if (data.eventType === "step_retrying") {
-			const eventData = data.eventData as {
-				error?: unknown;
-				stack?: string;
-				retryAfter?: string;
-			};
-			const errorObj = eventData.error as Record<string, unknown> | string;
-			const errorMessage =
-				typeof errorObj === "string"
-					? errorObj
-					: ((errorObj?.message as string) ?? "Unknown error");
-			const existingStep =
-				validatedStep ??
-				(await this.storage.get<Step>(KEY.step(data.correlationId as string)));
-			if (existingStep) {
-				const updated: Step = StepSchema.parse({
-					...existingStep,
-					status: "pending",
-					error: { message: errorMessage, stack: eventData.stack },
-					retryAfter: eventData.retryAfter
-						? new Date(eventData.retryAfter)
-						: undefined,
-					updatedAt: now,
-				});
-				await this.storage.put(KEY.step(data.correlationId as string), updated);
-				step = updated;
-			}
-		}
-
-		if (data.eventType === "hook_created") {
-			const eventData = data.eventData as {
-				token: string;
-				metadata?: unknown;
-				isWebhook?: boolean;
-			};
-
-			// Check for duplicate token
-			const existingTokenHookId = await this.storage.get<string>(
-				KEY.hookToken(eventData.token),
-			);
-			if (existingTokenHookId) {
-				// Create hook_conflict event
-				const conflictEventData = { token: eventData.token };
-				const conflictEvent = EventSchema.parse({
-					eventType: "hook_conflict",
-					correlationId: data.correlationId,
-					eventData: conflictEventData,
-					runId: effectiveRunId,
-					eventId,
-					createdAt: now,
-					specVersion: effectiveSpecVersion,
-				});
-				await this.storage.put(KEY.event(eventId), conflictEvent);
-				return {
-					event: filterEventData(conflictEvent, resolveData),
-					hook: undefined,
-				};
-			}
-
-			const newHook: Hook = HookSchema.parse({
-				runId: effectiveRunId,
-				hookId: data.correlationId,
-				token: eventData.token,
-				metadata: eventData.metadata,
-				ownerId: "",
-				projectId: "",
-				environment: "",
-				specVersion: effectiveSpecVersion,
-				isWebhook: eventData.isWebhook,
-				createdAt: now,
-			});
-
-			// Only create if doesn't exist
-			const existing = await this.storage.get(
-				KEY.hook(data.correlationId as string),
-			);
-			if (!existing) {
-				await this.storage.put(KEY.hook(data.correlationId as string), newHook);
-				await this.storage.put(
-					KEY.hookToken(eventData.token),
-					data.correlationId,
-				);
-				hook = newHook;
-
-				// Update D1 index (fire-and-forget)
-				insertHookIndex(this.db, {
-					hookId: data.correlationId as string,
-					runId: effectiveRunId,
-					token: eventData.token,
-					ownerId: "",
-					projectId: "",
-					environment: "",
-					createdAt: now.toISOString(),
-					isWebhook: eventData.isWebhook,
-					specVersion: effectiveSpecVersion,
-				}).catch(() => {});
-			}
-		}
-
-		if (data.eventType === "hook_disposed" && data.correlationId) {
-			const existingHook = await this.storage.get<Hook>(
-				KEY.hook(data.correlationId as string),
-			);
-			if (existingHook) {
-				await this.storage.delete(KEY.hook(data.correlationId as string));
-				await this.storage.delete(KEY.hookToken(existingHook.token));
-				deleteHookIndex(this.db, data.correlationId as string).catch(() => {});
-			}
-		}
-
-		if (data.eventType === "wait_created") {
-			const eventData = data.eventData as { resumeAt?: string };
-			const waitId = `${effectiveRunId}-${data.correlationId}`;
-			const existing = await this.storage.get(KEY.wait(waitId));
-			if (existing) {
-				throw new WorkflowAPIError(
-					`Wait "${data.correlationId}" already exists`,
-					{ status: 409 },
-				);
-			}
-			const newWait: Wait = {
-				waitId,
-				runId: effectiveRunId,
-				status: "waiting",
-				resumeAt: eventData.resumeAt ? new Date(eventData.resumeAt) : undefined,
-				createdAt: now,
-				updatedAt: now,
-				specVersion: effectiveSpecVersion,
-			};
-			await this.storage.put(KEY.wait(waitId), newWait);
-			wait = newWait;
-		}
-
-		if (data.eventType === "wait_completed") {
-			const waitId = `${effectiveRunId}-${data.correlationId}`;
-			const existingWait = await this.storage.get<Wait>(KEY.wait(waitId));
-			if (!existingWait) {
-				throw new WorkflowAPIError(`Wait "${data.correlationId}" not found`, {
-					status: 404,
-				});
-			}
-			if (existingWait.status === "completed") {
-				throw new WorkflowAPIError(
-					`Wait "${data.correlationId}" already completed`,
-					{ status: 409 },
-				);
-			}
-			const updated: Wait = {
-				...existingWait,
-				status: "completed",
-				completedAt: now,
-				updatedAt: now,
-			};
-			await this.storage.put(KEY.wait(waitId), updated);
-			wait = updated;
-		}
-
-		// Insert the event into DO storage
-		const event = await this.insertEvent(
-			effectiveRunId,
-			eventId,
-			data,
-			effectiveSpecVersion,
-		);
-
-		return {
-			event: filterEventData(event, resolveData),
-			run: run ? (filterRunData(run, resolveData) as WorkflowRun) : undefined,
-			step,
-			hook,
-			wait,
-		};
-	}
-
-	private async insertEvent(
-		runId: string,
-		eventId: string,
-		data: Record<string, unknown>,
-		specVersion: number,
-	): Promise<Event> {
-		const now = new Date();
-		const event = EventSchema.parse({
-			...data,
-			runId,
-			eventId,
-			createdAt: now,
-			specVersion,
-		});
-		await this.storage.put(KEY.event(eventId), event);
-		return event;
-	}
-
-	private async handleLegacyEvent(
-		runId: string,
-		eventId: string,
-		data: Record<string, unknown>,
-		currentRun: WorkflowRun,
-		params?: Record<string, unknown>,
-	): Promise<EventResult> {
-		const resolveData = (params?.resolveData as ResolveData) ?? "all";
-		const now = new Date();
-
-		switch (data.eventType) {
 			case "run_cancelled": {
-				const updated: WorkflowRun = WorkflowRunSchema.parse({
+				run = WorkflowRunSchema.parse({
 					...currentRun,
 					status: "cancelled",
 					completedAt: now,
 					updatedAt: now,
 				});
-				await this.storage.put(KEY.run, updated);
-				await this.disposeAllHooksAndWaits(runId);
-				this.updateRunIndex(updated);
-				return {
-					run: filterRunData(updated, resolveData) as WorkflowRun,
-				};
+				tx.put(KEY.run, run);
+				await terminalCleanup();
+				break;
 			}
 
+			case "attr_set": {
+				const eventData = data.eventData as {
+					changes: Parameters<typeof applyAttributeChanges>[1];
+					writer: { type: string };
+					allowReservedAttributes?: true;
+				};
+				const fresh = currentRun as WorkflowRun;
+				validateAttributeChanges(eventData.changes, {
+					existingKeys: Object.keys(fresh.attributes ?? {}),
+					allowReservedAttributes: eventData.allowReservedAttributes === true,
+				});
+				if (correlationId && eventData.writer.type === "workflow") {
+					if (await tx.get(KEY.attr(correlationId))) {
+						throw new EntityConflictError(
+							`Attribute event "${correlationId}" already exists`,
+						);
+					}
+					tx.put(KEY.attr(correlationId), true);
+				}
+				run = WorkflowRunSchema.parse({
+					...fresh,
+					attributes: applyAttributeChanges(
+						fresh.attributes ?? {},
+						eventData.changes,
+					),
+					updatedAt: now,
+				});
+				tx.put(KEY.run, run);
+				break;
+			}
+
+			case "step_created": {
+				const id = correlationId as string;
+				if (await tx.get(KEY.step(id))) {
+					throw new EntityConflictError(`Step "${id}" already created`);
+				}
+				const eventData = data.eventData as {
+					stepName: string;
+					input: unknown;
+				};
+				step = StepSchema.parse({
+					runId,
+					stepId: id,
+					stepName: eventData.stepName,
+					input: eventData.input,
+					status: "pending",
+					attempt: 0,
+					specVersion: effectiveSpecVersion,
+					createdAt: now,
+					updatedAt: now,
+				});
+				tx.put(KEY.step(id), step);
+				break;
+			}
+
+			case "step_started": {
+				const id = correlationId as string;
+				if (!validatedStep && lazyStepStart) {
+					// Lazy start: create the step, and a synthetic step_created at
+					// the slot below this step_started, so replay observes it.
+					const lazy = data.eventData as { stepName: string; input: unknown };
+					validatedStep = StepSchema.parse({
+						runId,
+						stepId: id,
+						stepName: lazy.stepName,
+						input: lazy.input,
+						status: "pending",
+						attempt: 0,
+						specVersion: effectiveSpecVersion,
+						createdAt: now,
+						updatedAt: now,
+					});
+					append({
+						eventType: "step_created",
+						runId,
+						correlationId: id,
+						createdAt: now,
+						specVersion: effectiveSpecVersion,
+						eventData: { stepName: lazy.stepName, input: lazy.input },
+					} as Omit<Event, "eventId">);
+					stepCreatedLazily = true;
+					const { input: _input, ...rest } = data.eventData as Record<
+						string,
+						unknown
+					>;
+					eventRow.eventData = rest;
+				}
+				const current = validatedStep as Step;
+				if (current.retryAfter && current.retryAfter.getTime() > Date.now()) {
+					throw new TooEarlyError(
+						`Cannot start step "${id}": retryAfter timestamp has not been reached yet`,
+						{
+							retryAfter: Math.ceil(
+								(current.retryAfter.getTime() - Date.now()) / 1000,
+							),
+						},
+					);
+				}
+				step = StepSchema.parse({
+					...current,
+					status: "running",
+					attempt: current.attempt + 1,
+					startedAt: current.startedAt ?? now,
+					retryAfter: undefined,
+					updatedAt: now,
+				});
+				tx.put(KEY.step(id), step);
+				break;
+			}
+
+			case "step_completed": {
+				const eventData = data.eventData as { result?: unknown };
+				step = StepSchema.parse({
+					...validatedStep,
+					status: "completed",
+					output: eventData.result,
+					completedAt: now,
+					updatedAt: now,
+				});
+				tx.put(KEY.step(correlationId as string), step);
+				break;
+			}
+
+			case "step_failed": {
+				const eventData = data.eventData as { error: unknown };
+				step = StepSchema.parse({
+					...validatedStep,
+					status: "failed",
+					error: eventData.error,
+					completedAt: now,
+					updatedAt: now,
+				});
+				tx.put(KEY.step(correlationId as string), step);
+				break;
+			}
+
+			case "step_retrying": {
+				const eventData = data.eventData as {
+					error: unknown;
+					retryAfter?: Date;
+				};
+				step = StepSchema.parse({
+					...validatedStep,
+					status: "pending",
+					error: eventData.error,
+					retryAfter: eventData.retryAfter,
+					updatedAt: now,
+				});
+				tx.put(KEY.step(correlationId as string), step);
+				break;
+			}
+
+			case "hook_created": {
+				const id = correlationId as string;
+				const eventData = data.eventData as {
+					token: string;
+					metadata?: unknown;
+					isWebhook?: boolean;
+					isSystem?: boolean;
+				};
+				if (await tx.get(KEY.hook(id))) {
+					throw new EntityConflictError(`Hook "${id}" already created`);
+				}
+				// Tokens are unique across runs, so the claim is settled by the
+				// D1 unique constraint rather than inside this run's storage.
+				const claim = await claimHookToken(this.db, {
+					hookId: id,
+					runId,
+					token: eventData.token,
+					createdAt: now.toISOString(),
+					isWebhook: eventData.isWebhook ?? false,
+					specVersion: effectiveSpecVersion,
+				});
+				if (claim.runId !== runId || claim.hookId !== id) {
+					const conflict = append({
+						eventType: "hook_conflict",
+						runId,
+						correlationId: id,
+						createdAt: now,
+						specVersion: effectiveSpecVersion,
+						eventData: {
+							token: eventData.token,
+							conflictingRunId: claim.runId,
+						},
+					} as Omit<Event, "eventId">);
+					await tx.commit();
+					return this.finish(runId, conflict, {}, params, seq);
+				}
+				releaseClaim = claim;
+				hook = HookSchema.parse({
+					runId,
+					hookId: id,
+					token: eventData.token,
+					metadata: eventData.metadata,
+					ownerId: "",
+					projectId: "",
+					environment: "",
+					specVersion: effectiveSpecVersion,
+					isWebhook: eventData.isWebhook ?? false,
+					isSystem: eventData.isSystem ?? false,
+					createdAt: now,
+				});
+				tx.put(KEY.hook(id), hook);
+				break;
+			}
+
+			case "hook_disposed": {
+				const id = correlationId as string;
+				tx.delete(KEY.hook(id));
+				tx.delete(KEY.hookCreated(id));
+				break;
+			}
+
+			case "hook_received":
+				// Stored in the log; the hook entity has no payload field.
+				break;
+
+			case "wait_created": {
+				const id = correlationId as string;
+				if (await tx.get(KEY.wait(id))) {
+					throw new EntityConflictError(`Wait "${id}" already exists`);
+				}
+				const eventData = data.eventData as { resumeAt?: Date };
+				wait = {
+					waitId: `${runId}-${id}`,
+					runId,
+					status: "waiting",
+					resumeAt: eventData.resumeAt,
+					createdAt: now,
+					updatedAt: now,
+					specVersion: effectiveSpecVersion,
+				};
+				tx.put(KEY.wait(id), wait);
+				break;
+			}
+
+			case "wait_completed": {
+				const id = correlationId as string;
+				const existingWait = await tx.get<Wait>(KEY.wait(id));
+				if (!existingWait) {
+					throw new WorkflowWorldError(`Wait "${id}" not found`, {
+						status: 404,
+					});
+				}
+				if (existingWait.status === "completed") {
+					throw new EntityConflictError(`Wait "${id}" already completed`);
+				}
+				wait = {
+					...existingWait,
+					status: "completed",
+					completedAt: now,
+					updatedAt: now,
+				};
+				tx.put(KEY.wait(id), wait);
+				break;
+			}
+
+			default:
+				throw new WorkflowWorldError(
+					`Unsupported event type "${data.eventType}"`,
+					{ status: 400 },
+				);
+		}
+
+		const event = append(eventRow as Omit<Event, "eventId">);
+		if (data.eventType === "hook_created") {
+			tx.put(KEY.hookCreated(correlationId as string), event.eventId);
+		}
+		if (data.eventType === "hook_received" && params?.resumeId) {
+			tx.put(KEY.resume(params.resumeId), {
+				hookId: correlationId as string,
+				eventId: event.eventId,
+				payloadDigest: params.resumePayloadDigest,
+			} satisfies ResumeClaim);
+		}
+
+		try {
+			await tx.commit();
+		} catch (err) {
+			if (releaseClaim) {
+				await deleteHookIndex(this.db, releaseClaim.hookId).catch(() => {});
+			}
+			throw err;
+		}
+
+		// D1 index side effects, after the commit they describe. Token releases
+		// are awaited so the token is free for another run by the time this
+		// response arrives. A failed release is logged and not retried, so the
+		// stale index row keeps the token claimed by this run.
+		const logIndexError = (err: unknown) =>
+			console.error(
+				"[workflow-world-cloudflare] hook index update failed",
+				err,
+			);
+		if (data.eventType === "hook_disposed") {
+			await deleteHookIndex(this.db, correlationId as string).catch(
+				logIndexError,
+			);
+		}
+		if (run && isTerminalWorkflowRunStatus(run.status)) {
+			await deleteHooksForRunIndex(this.db, runId).catch(logIndexError);
+		}
+		if (run) this.updateRunIndex(run);
+
+		const preload =
+			data.eventType === "run_started" && !params?.skipPreload
+				? await this.readEvents({ limit: DEFAULT_EVENTS_PAGE })
+				: undefined;
+
+		return this.finish(
+			runId,
+			event,
+			{
+				run: run
+					? (filterRunData(run, entityResolve(resolveData)) as WorkflowRun)
+					: undefined,
+				step,
+				hook,
+				wait,
+				...(stepCreatedLazily ? { stepCreated: true as const } : {}),
+			},
+			params,
+			seq,
+			preload,
+		);
+	}
+
+	/**
+	 * Attach the read-back halves of an `events.create` response: the
+	 * `sinceCursor` delta, the `run_started` preload, or the bump-and-report
+	 * span, in that order of precedence (they share `events`/`cursor`/
+	 * `hasMore`, and each later one is a subset of the earlier).
+	 */
+	private async finish(
+		_runId: string,
+		event: Event,
+		entities: Omit<EventResult, "event">,
+		params: CreateEventBody["params"],
+		committedSlot: number,
+		preload?: PaginatedResponse<Event>,
+	): Promise<EventResult> {
+		const resolveData = params?.resolveData ?? "all";
+		const strip = (events: Event[]) =>
+			events.map((e) => stripEventDataRefs(e, resolveData));
+		const result = {
+			event: stripEventDataRefs(event, resolveData),
+			...entities,
+		} as EventResult;
+
+		if (typeof params?.sinceCursor === "string") {
+			const delta = await this.readEvents({
+				cursor: params.sinceCursor,
+				limit: DEFAULT_EVENTS_PAGE,
+			});
+			return {
+				...result,
+				events: strip(delta.data),
+				cursor: delta.cursor,
+				hasMore: delta.hasMore,
+			};
+		}
+		if (preload) {
+			return {
+				...result,
+				events: strip(preload.data),
+				cursor: preload.cursor,
+				hasMore: preload.hasMore,
+			};
+		}
+
+		// Bump and report: the writer expected slot `eventCount + 1`. Every
+		// event between that slot and the one this write landed on is one the
+		// writer has not seen, so hand them back instead of rejecting.
+		const askedFor = params?.eventCount;
+		if (
+			typeof askedFor === "number" &&
+			askedFor >= FIRST_EVENT_SLOT - 1 &&
+			committedSlot > askedFor + 1
+		) {
+			const skipped = await this.readEvents({
+				cursor:
+					askedFor >= FIRST_EVENT_SLOT ? slotToEventId(askedFor) : undefined,
+				limit: committedSlot - askedFor - 1,
+			});
+			const events = skipped.data.filter((e) => e.eventId < event.eventId);
+			return {
+				...result,
+				events: strip(events),
+				// Not a page the writer has read to the end of, so it must not
+				// advance the writer's read position.
+				cursor: null,
+				hasMore: false,
+			};
+		}
+		return result;
+	}
+
+	private async handleLegacyEvent(
+		tx: Staged,
+		runId: string,
+		data: CreateEventBody["data"],
+		currentRun: WorkflowRun,
+		append: (event: Omit<Event, "eventId">) => Event,
+	): Promise<EventResult> {
+		const now = new Date();
+		switch (data.eventType) {
+			case "run_cancelled": {
+				const updated = WorkflowRunSchema.parse({
+					...currentRun,
+					status: "cancelled",
+					completedAt: now,
+					updatedAt: now,
+				});
+				tx.put(KEY.run, updated);
+				await this.disposeAllHooksAndWaits(tx);
+				await tx.commit();
+				this.updateRunIndex(updated);
+				return { run: updated };
+			}
 			case "wait_completed":
 			case "hook_received": {
-				const event = await this.insertEvent(
+				const event = append({
+					...data,
 					runId,
-					eventId,
-					data,
-					SPEC_VERSION_CURRENT,
-				);
-				return { event: filterEventData(event, resolveData) };
+					createdAt: now,
+					specVersion: SPEC_VERSION_CURRENT,
+				} as Omit<Event, "eventId">);
+				await tx.commit();
+				return { event };
 			}
-
 			default:
 				throw new Error(
 					`Event type '${data.eventType}' not supported for legacy runs ` +
@@ -952,29 +1220,12 @@ export class WorkflowRunDO implements DurableObject {
 		}
 	}
 
-	private async disposeAllHooksAndWaits(runId: string): Promise<void> {
-		// Delete all hooks
-		const hookEntries = await this.storage.list<Hook>({ prefix: "hook:" });
-		const keysToDelete: string[] = [];
-		for (const [key, hookValue] of hookEntries) {
-			keysToDelete.push(key);
-			if (hookValue && typeof hookValue === "object" && "token" in hookValue) {
-				keysToDelete.push(KEY.hookToken(hookValue.token));
+	private async disposeAllHooksAndWaits(tx: Staged): Promise<void> {
+		for (const prefix of ["hook:", "hook_evt:", "wait:"]) {
+			for (const key of (await tx.list(prefix)).keys()) {
+				tx.delete(key);
 			}
 		}
-
-		// Delete all waits
-		const waitEntries = await this.storage.list({ prefix: "wait:" });
-		for (const [key] of waitEntries) {
-			keysToDelete.push(key);
-		}
-
-		if (keysToDelete.length > 0) {
-			await this.storage.delete(keysToDelete);
-		}
-
-		// Delete from D1 index
-		deleteHooksForRunIndex(this.db, runId).catch(() => {});
 	}
 
 	private updateRunIndex(run: WorkflowRun): void {
@@ -989,7 +1240,9 @@ export class WorkflowRunDO implements DurableObject {
 			startedAt: toISOOrUndef(run.startedAt),
 			completedAt: toISOOrUndef(run.completedAt),
 			expiredAt: toISOOrUndef(run.expiredAt),
-		}).catch(() => {});
+		}).catch((err) => {
+			console.error("[workflow-world-cloudflare] run index update failed", err);
+		});
 	}
 
 	// ============================================================
@@ -1002,74 +1255,79 @@ export class WorkflowRunDO implements DurableObject {
 	): Promise<Event> {
 		const event = await this.storage.get<Event>(KEY.event(eventId));
 		if (!event) {
-			throw new WorkflowAPIError(`Event not found: ${eventId}`, {
+			throw new WorkflowWorldError(`Event not found: ${eventId}`, {
 				status: 404,
 			});
 		}
-		return filterEventData(event, resolveData);
+		return stripEventDataRefs(event, resolveData);
+	}
+
+	/**
+	 * One page of the log in slot order. The cursor is the last eventId the
+	 * caller has, and is exclusive.
+	 */
+	private async readEvents(
+		opts: { cursor?: string; limit?: number; sortOrder?: "asc" | "desc" },
+		tx?: Staged,
+	): Promise<PaginatedResponse<Event>> {
+		const limit = Math.min(opts.limit ?? DEFAULT_EVENTS_PAGE, MAX_EVENTS_PAGE);
+		const desc = opts.sortOrder === "desc";
+		const listed = tx
+			? await tx.list<Event>("evt:")
+			: await this.storage.list<Event>({
+					prefix: "evt:",
+					...(opts.cursor
+						? desc
+							? { end: KEY.event(opts.cursor) }
+							: { startAfter: KEY.event(opts.cursor) }
+						: {}),
+					reverse: desc,
+					limit: limit + 1,
+				});
+		let entries = [...listed.entries()]
+			.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+			.map(([, v]) => v);
+		if (desc) entries.reverse();
+		if (tx && opts.cursor) {
+			const c = opts.cursor;
+			entries = entries.filter((e) => (desc ? e.eventId < c : e.eventId > c));
+		}
+		const data = entries.slice(0, limit);
+		const hasMore = entries.length > limit;
+		return { data, cursor: data.at(-1)?.eventId ?? null, hasMore };
 	}
 
 	private async listEvents(params: {
-		limit: number;
+		limit?: number;
 		cursor?: string;
 		sortOrder: "asc" | "desc";
-		resolveData: ResolveData;
+		resolveData: EventsResolveData;
+		correlationId?: string;
 	}): Promise<PaginatedResponse<Event>> {
-		const all = await this.storage.list<Event>({ prefix: "evt:" });
-		let entries = [...all.entries()].map(([, v]) => v);
-
-		if (params.sortOrder === "desc") {
-			entries.reverse();
-		}
-
-		// Apply cursor
-		if (params.cursor) {
-			const idx = entries.findIndex((e) => e.eventId === params.cursor);
-			if (idx >= 0) {
-				entries = entries.slice(idx + 1);
+		if (params.correlationId) {
+			const all = await this.storage.list<Event>({ prefix: "evt:" });
+			let entries = [...all.values()].filter(
+				(e) => e.correlationId === params.correlationId,
+			);
+			if (params.sortOrder === "desc") entries.reverse();
+			if (params.cursor) {
+				const c = params.cursor;
+				entries = entries.filter((e) =>
+					params.sortOrder === "desc" ? e.eventId < c : e.eventId > c,
+				);
 			}
+			const limit = params.limit ?? 100;
+			const data = entries.slice(0, limit);
+			return {
+				data: data.map((e) => stripEventDataRefs(e, params.resolveData)),
+				cursor: data.at(-1)?.eventId ?? null,
+				hasMore: entries.length > limit,
+			};
 		}
-
-		const data = entries.slice(0, params.limit);
-		const hasMore = entries.length > params.limit;
-
+		const page = await this.readEvents(params);
 		return {
-			data: data.map((e) => filterEventData(e, params.resolveData)),
-			cursor: data.at(-1)?.eventId ?? null,
-			hasMore,
-		};
-	}
-
-	private async listEventsByCorrelationId(params: {
-		correlationId: string;
-		limit: number;
-		cursor?: string;
-		sortOrder: "asc" | "desc";
-		resolveData: ResolveData;
-	}): Promise<PaginatedResponse<Event>> {
-		const all = await this.storage.list<Event>({ prefix: "evt:" });
-		let entries = [...all.entries()]
-			.map(([, v]) => v)
-			.filter((e) => e.correlationId === params.correlationId);
-
-		if (params.sortOrder === "desc") {
-			entries.reverse();
-		}
-
-		if (params.cursor) {
-			const idx = entries.findIndex((e) => e.eventId === params.cursor);
-			if (idx >= 0) {
-				entries = entries.slice(idx + 1);
-			}
-		}
-
-		const data = entries.slice(0, params.limit);
-		const hasMore = entries.length > params.limit;
-
-		return {
-			data: data.map((e) => filterEventData(e, params.resolveData)),
-			cursor: data.at(-1)?.eventId ?? null,
-			hasMore,
+			...page,
+			data: page.data.map((e) => stripEventDataRefs(e, params.resolveData)),
 		};
 	}
 
@@ -1083,12 +1341,11 @@ export class WorkflowRunDO implements DurableObject {
 	): Promise<Step | StepWithoutData> {
 		const step = await this.storage.get<Step>(KEY.step(stepId));
 		if (!step) {
-			throw new WorkflowAPIError(`Step not found: ${stepId}`, {
+			throw new WorkflowWorldError(`Step not found: ${stepId}`, {
 				status: 404,
 			});
 		}
-		const parsed = StepSchema.parse(step);
-		return filterStepData(parsed, resolveData);
+		return filterStepData(StepSchema.parse(step), resolveData);
 	}
 
 	private async listSteps(params: {
@@ -1097,27 +1354,20 @@ export class WorkflowRunDO implements DurableObject {
 		resolveData: ResolveData;
 	}): Promise<PaginatedResponse<Step | StepWithoutData>> {
 		const all = await this.storage.list<Step>({ prefix: "step:" });
-		let entries = [...all.entries()]
-			.map(([, v]) => v)
-			.sort((a, b) => (b.stepId > a.stepId ? 1 : -1)); // desc by stepId
-
+		let entries = [...all.values()].sort((a, b) =>
+			b.stepId > a.stepId ? 1 : -1,
+		);
 		if (params.cursor) {
-			const idx = entries.findIndex((e) => e.stepId === params.cursor);
-			if (idx >= 0) {
-				entries = entries.slice(idx + 1);
-			}
+			const c = params.cursor;
+			entries = entries.filter((e) => e.stepId < c);
 		}
-
 		const data = entries.slice(0, params.limit);
-		const hasMore = entries.length > params.limit;
-
 		return {
-			data: data.map((s) => {
-				const parsed = StepSchema.parse(s);
-				return filterStepData(parsed, params.resolveData);
-			}),
+			data: data.map((s) =>
+				filterStepData(StepSchema.parse(s), params.resolveData),
+			),
 			cursor: data.at(-1)?.stepId ?? null,
-			hasMore,
+			hasMore: entries.length > params.limit,
 		};
 	}
 
@@ -1133,9 +1383,7 @@ export class WorkflowRunDO implements DurableObject {
 		if (!hook) {
 			throw new HookNotFoundError(hookId);
 		}
-		const parsed = HookSchema.parse(hook);
-		parsed.isWebhook ??= true;
-		return filterHookData(parsed, resolveData);
+		return filterHookData(HookSchema.parse(hook), resolveData);
 	}
 
 	private async listHooks(params: {
@@ -1145,117 +1393,176 @@ export class WorkflowRunDO implements DurableObject {
 		resolveData: ResolveData;
 	}): Promise<PaginatedResponse<Hook>> {
 		const all = await this.storage.list<Hook>({ prefix: "hook:" });
-		let entries = [...all.entries()]
-			.filter(([key]) => !key.startsWith("hook_tok:"))
-			.map(([, v]) => v);
-
-		if (params.sortOrder === "desc") {
-			entries.reverse();
-		}
-
+		let entries = [...all.values()];
+		if (params.sortOrder === "desc") entries.reverse();
 		if (params.cursor) {
 			const idx = entries.findIndex((e) => e.hookId === params.cursor);
-			if (idx >= 0) {
-				entries = entries.slice(idx + 1);
-			}
+			if (idx >= 0) entries = entries.slice(idx + 1);
 		}
-
 		const data = entries.slice(0, params.limit);
-		const hasMore = entries.length > params.limit;
-
 		return {
-			data: data.map((h) => {
-				const parsed = HookSchema.parse(h);
-				parsed.isWebhook ??= true;
-				return filterHookData(parsed, params.resolveData);
-			}),
+			data: data.map((h) =>
+				filterHookData(HookSchema.parse(h), params.resolveData),
+			),
 			cursor: data.at(-1)?.hookId ?? null,
-			hasMore,
+			hasMore: entries.length > params.limit,
 		};
 	}
 
 	// ============================================================
-	// Stream operations
+	// Streams
 	// ============================================================
 
-	private async writeStreamChunk(
-		streamId: string,
-		chunk: number[] | string,
-		_runId: string,
-	): Promise<void> {
-		const chunkId = `chnk_${ulid()}`;
-		const data: StreamChunkData = {
-			data:
-				typeof chunk === "string"
-					? [...new TextEncoder().encode(chunk)]
-					: chunk,
-			eof: false,
-		};
-		await this.storage.put(KEY.streamChunk(streamId, chunkId), data);
-		await this.ensureStreamIndexed(streamId);
+	private notifyStream(name: string): void {
+		const waiters = this.streamWaiters.get(name);
+		if (!waiters) return;
+		this.streamWaiters.delete(name);
+		for (const wake of waiters) wake();
 	}
 
 	private async writeStreamChunks(
-		streamId: string,
-		chunks: (number[] | string)[],
-		_runId: string,
+		name: string,
+		chunks: Uint8Array[],
 	): Promise<void> {
 		if (chunks.length === 0) return;
-		const entries: Record<string, StreamChunkData> = {};
+		const meta = (await this.storage.get<StreamMeta>(KEY.streamMeta(name))) ?? {
+			count: 0,
+			done: false,
+		};
+		const entries: Record<string, unknown> = {};
 		for (const chunk of chunks) {
-			const chunkId = `chnk_${ulid()}`;
-			entries[KEY.streamChunk(streamId, chunkId)] = {
-				data:
-					typeof chunk === "string"
-						? [...new TextEncoder().encode(chunk)]
-						: chunk,
-				eof: false,
-			};
+			entries[KEY.streamChunk(name, meta.count)] = chunk;
+			meta.count += 1;
 		}
-		await this.storage.put(entries);
-		await this.ensureStreamIndexed(streamId);
+		entries[KEY.streamMeta(name)] = meta;
+		const streams = (await this.storage.get<string[]>(KEY.streamIndex)) ?? [];
+		if (!streams.includes(name)) {
+			entries[KEY.streamIndex] = [...streams, name];
+		}
+		for (let i = 0, keys = Object.keys(entries); i < keys.length; i += 128) {
+			const slice = keys.slice(i, i + 128);
+			await this.storage.put(
+				Object.fromEntries(slice.map((k) => [k, entries[k]])),
+			);
+		}
+		this.notifyStream(name);
 	}
 
-	private async closeStream(streamId: string, _runId: string): Promise<void> {
-		const chunkId = `chnk_${ulid()}`;
-		const data: StreamChunkData = { data: [], eof: true };
-		await this.storage.put(KEY.streamChunk(streamId, chunkId), data);
-		await this.storage.put(KEY.streamMeta(streamId), { eof: true });
+	private async closeStream(name: string): Promise<void> {
+		const meta = (await this.storage.get<StreamMeta>(KEY.streamMeta(name))) ?? {
+			count: 0,
+			done: false,
+		};
+		const streams = (await this.storage.get<string[]>(KEY.streamIndex)) ?? [];
+		await this.storage.put({
+			[KEY.streamMeta(name)]: { ...meta, done: true },
+			...(streams.includes(name)
+				? {}
+				: { [KEY.streamIndex]: [...streams, name] }),
+		});
+		this.notifyStream(name);
 	}
 
+	/**
+	 * A live tail of the stream from `startIndex` (negative counts back from
+	 * the current end). It delivers what is already written, then waits for
+	 * further writes, and ends when the stream is closed.
+	 */
 	private async readStream(
-		streamId: string,
+		name: string,
 		startIndex: number,
 	): Promise<ReadableStream<Uint8Array>> {
-		const prefix = `strm:${streamId}:chnk:`;
-		const all = await this.storage.list<StreamChunkData>({ prefix });
-		const chunks = [...all.entries()].map(([, v]) => v).slice(startIndex);
+		const initial = (await this.storage.get<StreamMeta>(
+			KEY.streamMeta(name),
+		)) ?? { count: 0, done: false };
+		let next =
+			startIndex < 0 ? Math.max(0, initial.count + startIndex) : startIndex;
+		const waitForChange = () =>
+			new Promise<void>((resolve) => {
+				let waiters = this.streamWaiters.get(name);
+				if (!waiters) {
+					waiters = new Set();
+					this.streamWaiters.set(name, waiters);
+				}
+				const wake = () => {
+					clearTimeout(timer);
+					resolve();
+				};
+				// Bounded so a missed wake-up costs a second, not a hang.
+				const timer = setTimeout(() => {
+					waiters?.delete(wake);
+					resolve();
+				}, 1000);
+				waiters.add(wake);
+			});
 
 		return new ReadableStream<Uint8Array>({
-			start(controller) {
-				for (const chunk of chunks) {
-					if (chunk.data.length > 0) {
-						controller.enqueue(new Uint8Array(chunk.data));
+			pull: async (controller) => {
+				for (;;) {
+					const meta = (await this.storage.get<StreamMeta>(
+						KEY.streamMeta(name),
+					)) ?? { count: 0, done: false };
+					if (next < meta.count) {
+						const end = Math.min(meta.count, next + 128);
+						const listed = await this.storage.list<Uint8Array>({
+							start: KEY.streamChunk(name, next),
+							end: KEY.streamChunk(name, end),
+						});
+						for (const chunk of listed.values()) {
+							controller.enqueue(chunk);
+						}
+						next = end;
+						return;
 					}
-					if (chunk.eof) {
+					if (meta.done) {
 						controller.close();
 						return;
 					}
+					await waitForChange();
 				}
-				controller.close();
 			},
 		});
 	}
 
-	private async listStreams(): Promise<string[]> {
-		return (await this.storage.get<string[]>(KEY.streamIndex)) ?? [];
+	private async getStreamChunks(
+		name: string,
+		options: { limit: number; cursor?: string },
+	): Promise<StreamChunksResponse> {
+		const meta = (await this.storage.get<StreamMeta>(KEY.streamMeta(name))) ?? {
+			count: 0,
+			done: false,
+		};
+		const start = options.cursor ? Number.parseInt(options.cursor, 10) || 0 : 0;
+		const end = Math.min(meta.count, start + Math.min(options.limit, 1000));
+		const listed =
+			end > start
+				? await this.storage.list<Uint8Array>({
+						start: KEY.streamChunk(name, start),
+						end: KEY.streamChunk(name, end),
+					})
+				: new Map<string, Uint8Array>();
+		const data = [...listed.values()].map((chunk, i) => ({
+			index: start + i,
+			data: chunk,
+		}));
+		const hasMore = end < meta.count;
+		return {
+			data,
+			cursor: hasMore ? String(end) : null,
+			hasMore,
+			done: meta.done && !hasMore,
+		};
 	}
 
-	private async ensureStreamIndexed(streamId: string): Promise<void> {
-		const streams = (await this.storage.get<string[]>(KEY.streamIndex)) ?? [];
-		if (!streams.includes(streamId)) {
-			streams.push(streamId);
-			await this.storage.put(KEY.streamIndex, streams);
-		}
+	private async getStreamInfo(name: string): Promise<StreamInfoResponse> {
+		const meta = (await this.storage.get<StreamMeta>(KEY.streamMeta(name))) ?? {
+			count: 0,
+			done: false,
+		};
+		return { tailIndex: meta.count - 1, done: meta.done };
+	}
+
+	private async listStreams(): Promise<string[]> {
+		return (await this.storage.get<string[]>(KEY.streamIndex)) ?? [];
 	}
 }
